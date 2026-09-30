@@ -99,6 +99,87 @@ uv run train.py --env_id "humanoid" --eval_env_id "humanoid" --num_epochs 100 --
 >[!NOTE]
 >If you would like the experiments to be synced to wandb, you should go to `train.py` and replace the default values of `wandb_entity` and `wandb_project_name` (line 34-35 of the `train.py` file) with your particular wandb entity and wandb project name. Alternatively, these two can also be set as hyperparameter flags when running the train script.
 
+# Hierarchical training on a fixed point-maze task
+
+`train_hierarchical.py` trains a SAC manager and a Scaling-CRL worker jointly
+from scratch in the local Brax point U-maze. Follow the installation and two
+Brax fixes above first. The existing `train.py` entry point is unchanged in use.
+
+The point starts at `(4, 4)` and the task target is fixed at `(12, 4)`. Reward
+is 1 within radius 0.5 of that target and 0 elsewhere, with no success
+termination. Episodes last 1,000 steps by default. The manager sees the full
+observation (position, velocity, task target); the worker sees position,
+velocity, and the manager's absolute XY command. Commands range over
+`[2, 14]²` and are held for 25 steps, including across collection chunks.
+
+The manager uses twin scalar BroNet critics (256 units, two residual blocks)
+and their **mean** in both the TD target and actor loss. Its actor also learns
+through the worker's action and entropy, with weight 1. Worker parameters stay
+fixed during this manager gradient, and the score's goal-encoder input is
+detached. The worker retains this repo's CRL networks and future-goal losses.
+Both levels tune their own temperature; manager target entropy defaults to
+`-0.5 * goal_dim = -1` in normalized manager-action coordinates.
+
+A small smoke run (CPU is sufficient; first compilation takes time):
+
+```sh
+uv run train_hierarchical.py \
+  --num-envs 2 --num-eval-envs 2 --episode-length 16 \
+  --subgoal-steps 3 --unroll-length 5 --min-replay-size 5 \
+  --max-replay-size 24 --manager-replay-size 8 --batch-size 8 \
+  --updates-per-collect 1 --total-env-steps 80 \
+  --actor-network-width 16 --critic-network-width 16 \
+  --manager-width 16 --manager-num-blocks 1 \
+  --log-every 2 --eval-every 4 --save-replay --no-capture-vis \
+  --output-dir runs/hierarchical_smoke
+```
+
+A full training run (GPU recommended):
+
+```sh
+uv run train_hierarchical.py \
+  --total-env-steps 100000000 --num-envs 128 \
+  --actor-depth 16 --critic-depth 16 \
+  --output-dir runs/hierarchical_pointmaze
+```
+
+Use `--help` for all settings. `--manager-worker-weight 0` disables the extra
+worker-gradient term, `--manager-entropy-coefficient` controls the manager
+entropy target, and `--worker-discount` controls future-goal sampling separately
+from `--manager-discount`. Network depth retains the original CRL convention
+of four layers per residual block. Replay capacities and warmup are per
+environment; `--updates-per-collect` is the number of joint learner updates
+after each `num_envs * unroll_length` collection batch. The step budget rounds
+up to a complete collection batch.
+
+Worker replay filters future goals by episode ID and uses the current state
+when no future goal remains. Manager replay contains only completed command
+intervals and their original manager actions. Autoreset timeouts mask the
+entire interval's critic loss because its endpoint observation was replaced;
+true terminal intervals retain their reward with zero bootstrap. Actor and
+temperature updates can still use the valid starting states of these intervals.
+
+Each run writes `config.json`, `metrics.jsonl`, and `checkpoint.pkl`. Metrics
+include return, success rate, final distance, losses, temperatures, goal
+saturation, and the manager's Q and worker gradient contributions. Default
+final visualization writes `policy.html` and `manager_goals.npy` using the same
+goal commitment as training. Add `--track` to enable W&B (offline by default).
+
+Checkpoints save both learners, optimizers, target critics, RNG, and counters.
+With `--save-replay`, they also save both buffers and the active rollout,
+including unfinished command intervals. Resume with:
+
+```sh
+uv run train_hierarchical.py \
+  --resume runs/hierarchical_pointmaze/checkpoint.pkl \
+  --total-env-steps 200000000 --output-dir runs/hierarchical_pointmaze_resumed
+```
+
+Resume restores the saved learning/environment configuration; run budget,
+logging intervals, output, replay export, and visualization controls come from
+the new command. Without saved replay, collection starts fresh and warms up
+again while retaining learned parameters, optimizer states, and counters.
+
 # Citing Scaling CRL 📜
 ```bibtex
 @inproceedings{wang2025,
@@ -187,4 +268,3 @@ uv run train.py --env_id "humanoid" --eval_env_id "humanoid" --num_epochs 100 --
     if (rgba == jp.array([0.5, 0.5, 0.5, 1.0])).all():
     ```
 3. Save the file and rerun the training script. -->
-

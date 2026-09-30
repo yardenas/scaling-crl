@@ -148,6 +148,8 @@ class SimpleMaze(PipelineEnv):
         backend="generalized",
         maze_layout_name="u_maze",
         maze_size_scaling=4.0,
+        fixed_target=None,
+        sparse_reward=False,
         **kwargs,
     ):
         xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
@@ -155,6 +157,8 @@ class SimpleMaze(PipelineEnv):
         sys = mjcf.loads(xml_string)
         self.possible_starts = possible_starts
         self.possible_goals = possible_goals
+        self.fixed_target = None if fixed_target is None else jp.asarray(fixed_target)
+        self.sparse_reward = sparse_reward
 
         n_frames = 5
 
@@ -278,6 +282,8 @@ class SimpleMaze(PipelineEnv):
         success = jp.array(dist < 0.5, dtype=float)
         success_easy = jp.array(dist < 2., dtype=float)
         reward = -dist + healthy_reward - ctrl_cost - contact_cost
+        if self.sparse_reward:
+            reward = success
         state.metrics.update(
             reward_forward=forward_reward,
             reward_survive=healthy_reward,
@@ -313,6 +319,8 @@ class SimpleMaze(PipelineEnv):
 
     def _random_target(self, rng: jax.Array) -> jax.Array:
         """Returns a random target location chosen from possibilities specified in the maze layout."""
+        if self.fixed_target is not None:
+            return self.fixed_target
         idx = jax.random.randint(rng, (1,), 0, len(self.possible_goals))
         return jp.array(self.possible_goals[idx])[0]
 
