@@ -1,0 +1,47 @@
+defaults:
+  - _self_
+  - agent: hierarchical_sac
+
+hydra:
+  run:
+    dir: ${save_dir}/hydra/${run_group}/${now:%Y-%m-%d_%H-%M-%S-%f}/seed_${seed}
+  sweep:
+    dir: ${save_dir}/hydra/multirun/${run_group}/${now:%Y-%m-%d_%H-%M-%S-%f}
+    subdir: ${hydra.job.num}_seed_${seed}
+  job:
+    chdir: true
+    config:
+      override_dirname:
+        exclude_keys: [save_dir, seed, wandb]
+
+run_group: pointmaze-hierarchical
+seed: 0
+save_dir: runs
+backend: generalized
+target: [12.0, 4.0]
+episode_length: 1000
+num_envs: 128
+eval_episodes: 32
+online_steps: 100000000
+unroll_length: 64
+# Total transitions across all environments, rounded up to per-stream capacity.
+buffer_size: 1280000
+manager_buffer_size: 256000
+start_training: 128000
+# Joint minibatch updates per num_envs * unroll_length collection batch.
+updates_per_collect: 64
+# Global environment-step intervals, executed at the next collection boundary.
+log_interval: 81920
+eval_interval: 819200
+save_interval: 819200
+discount: 0.99
+resume: null
+save_replay: false
+capture_vis: true
+vis_length: 1000
+
+wandb:
+  enabled: false
+  project: hierarchical-scaling-crl
+  entity: null
+  mode: offline

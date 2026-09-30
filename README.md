@@ -120,65 +120,134 @@ detached. The worker retains this repo's CRL networks and future-goal losses.
 Both levels tune their own temperature; manager target entropy defaults to
 `-0.5 * goal_dim = -1` in normalized manager-action coordinates.
 
+The hierarchical entry point uses Hydra, with the same config-group and
+Submitit launcher workflow as `dyna-mpo/main.py`. Run `uv sync` to install
+`hydra-core` and `hydra-submitit-launcher`. `train_hierarchical.py` also accepts
+the same Hydra arguments; the old `--flag value` CLI has been replaced by
+`key=value` overrides. The original standalone `train.py` still uses Tyro.
+
 A small smoke run (CPU is sufficient; first compilation takes time):
 
 ```sh
-uv run train_hierarchical.py \
-  --num-envs 2 --num-eval-envs 2 --episode-length 16 \
-  --subgoal-steps 3 --unroll-length 5 --min-replay-size 5 \
-  --max-replay-size 24 --manager-replay-size 8 --batch-size 8 \
-  --updates-per-collect 1 --total-env-steps 80 \
-  --actor-network-width 16 --critic-network-width 16 \
-  --manager-width 16 --manager-num-blocks 1 \
-  --log-every 2 --eval-every 4 --save-replay --no-capture-vis \
-  --output-dir runs/hierarchical_smoke
+uv run python main.py +experiment=smoke save_dir=/tmp/scaling-crl-smoke
 ```
 
 A full training run (GPU recommended):
 
 ```sh
-uv run train_hierarchical.py \
-  --total-env-steps 100000000 --num-envs 128 \
-  --actor-depth 16 --critic-depth 16 \
-  --output-dir runs/hierarchical_pointmaze
+uv run python main.py +experiment=pointmaze_hierarchical \
+  seed=0 online_steps=100000000 save_dir=runs
 ```
 
-Use `--help` for all settings. `--manager-worker-weight 0` disables the extra
-worker-gradient term, `--manager-entropy-coefficient` controls the manager
-entropy target, and `--worker-discount` controls future-goal sampling separately
-from `--manager-discount`. Network depth retains the original CRL convention
-of four layers per residual block. Replay capacities and warmup are per
-environment; `--updates-per-collect` is the number of joint learner updates
-after each `num_envs * unroll_length` collection batch. The step budget rounds
-up to a complete collection batch.
+The configs are organized as follows:
 
-Worker replay filters future goals by episode ID and uses the current state
-when no future goal remains. Manager replay contains only completed command
-intervals and their original manager actions. Autoreset timeouts mask the
-entire interval's critic loss because its endpoint observation was replaced;
-true terminal intervals retain their reward with zero bootstrap. Actor and
-temperature updates can still use the valid starting states of these intervals.
+- `configs/main.yaml`: run budget, environment, replay, logging, W&B, and output paths.
+- `configs/agent/hierarchical_sac.yaml`: worker and manager learning parameters.
+- `configs/experiment/`: reusable experiment presets; `pointmaze_hierarchical`
+  uses worker depth 16 and five seeds in multirun mode.
+- `configs/hydra/launcher/slurm.yaml` and `configs/hardware/`: Submitit Slurm
+  resources and the reference repo's RTX 4090/3090 hardware profiles.
 
-Each run writes `config.json`, `metrics.jsonl`, and `checkpoint.pkl`. Metrics
-include return, success rate, final distance, losses, temperatures, goal
-saturation, and the manager's Q and worker gradient contributions. Default
-final visualization writes `policy.html` and `manager_goals.npy` using the same
-goal commitment as training. Add `--track` to enable W&B (offline by default).
+Override learner settings with `agent.*`, for example
+`agent.manager_worker_weight=0`, `agent.actor_depth=16`, or
+`agent.manager_entropy_coefficient=0.5`. `discount` sets the manager's discount;
+`agent.worker_discount` controls future-goal sampling independently. Network
+depth retains the original CRL convention of four layers per residual block.
+Use `--cfg job --resolve` to inspect the composed experiment without training.
 
-Checkpoints save both learners, optimizers, target critics, RNG, and counters.
-With `--save-replay`, they also save both buffers and the active rollout,
-including unfinished command intervals. Resume with:
+### Sweeps and Slurm
+
+A local sweep runs the Cartesian product of the specified values:
 
 ```sh
-uv run train_hierarchical.py \
-  --resume runs/hierarchical_pointmaze/checkpoint.pkl \
-  --total-env-steps 200000000 --output-dir runs/hierarchical_pointmaze_resumed
+uv run python main.py -m +experiment=smoke \
+  seed=0,1 agent.manager_worker_weight=0,1
 ```
 
-Resume restores the saved learning/environment configuration; run budget,
-logging intervals, output, replay export, and visualization controls come from
-the new command. Without saved replay, collection starts fresh and warms up
-again while retaining learned parameters, optimizer states, and counters.
+The worker-gradient ablation preset expands to 10 runs: five paired seeds at
+weights 0 and 1. Submit it from the cluster with:
+
+```sh
+MUJOCO_GL=disable uv run python main.py -m \
+  +experiment=pointmaze_worker_gradient \
+  hydra/launcher=slurm +hardware=4090_rtx \
+  hydra.launcher.timeout_min=240 hydra.launcher.array_parallelism=10 \
+  save_dir=/cluster/scratch/$USER/scaling-crl \
+  wandb.enabled=true wandb.mode=offline
+```
+
+`-m` is required to use the Submitit launcher. Without a launcher override,
+Hydra runs the sweep locally. Use `hydra/launcher=submitit_local` to smoke-test
+Submitit locally. Command-line sweep values override the preset's sweep values.
+
+The Slurm profile matches the reference's Euler resources: one RTX 4090,
+10 CPUs, 10 GiB per CPU, and account `ls_krausea`. Select `+hardware=3090_rtx`
+or override `hydra.launcher.account`, `hydra.launcher.partition`,
+`hydra.launcher.mem_per_cpu`, and `hydra.launcher.additional_parameters.gpus`
+for another allocation. Timeouts default to 60 minutes; choose a suitable
+limit for the experiment. Automatic timeout retries are disabled because the
+launcher would restart the entry point; resume from a saved checkpoint instead.
+The repository and installed virtual environment must be accessible to compute
+nodes. Preview the launcher configuration without submitting:
+
+```sh
+uv run python main.py hydra/launcher=slurm +hardware=4090_rtx \
+  --cfg hydra -p hydra.launcher
+```
+
+### Parameter units and saved runs
+
+`online_steps`, `start_training`, `log_interval`, `eval_interval`, and
+`save_interval` count **global primitive environment steps**. Collection is
+batched, so budgets and interval events occur at the next collection boundary;
+intervals need not divide the batch size. A nonpositive interval disables its
+periodic event; final evaluation and checkpointing still run.
+
+`buffer_size` and `manager_buffer_size` count total transitions across all
+environments. They are rounded up to per-environment capacities internally.
+`agent.batch_size` is the learner minibatch size. `eval_episodes` is the number
+of parallel evaluation episodes. `updates_per_collect` counts joint learner
+updates after each `num_envs * unroll_length` collection batch; it is deliberately
+not called `utd_ratio`, since the reference's per-step update scheduling differs.
+The default values retain this trainer's previous effective schedule.
+
+Worker replay filters future goals by episode ID and uses the current state
+when no future goal remains. Manager replay contains completed command intervals
+and original manager actions. Autoreset timeouts mask the entire interval's
+critic loss because its endpoint observation was replaced; true terminal
+intervals retain their reward with zero bootstrap. Actor and temperature
+updates can still use valid starting states from those intervals.
+
+Hydra creates a separate directory for every job under `save_dir/hydra/` or
+`save_dir/hydra/multirun/`, grouped by `run_group` and timestamp. Sweep subdirectories
+include the job number and seed, so different settings with the same seed do
+not overwrite each other. Each job writes `.hydra/` configs and overrides,
+`resolved_config.yaml`, effective training `config.json`, `metrics.jsonl`, and
+`checkpoint.pkl`. Submitit logs and job metadata live in the sweep's `.submitit/`
+directory. Set `save_dir` to cluster scratch for experiments.
+
+Metrics include return, success rate, final distance, losses, temperatures,
+goal saturation, and manager gradient contributions. `wandb.enabled=true`
+enables tracking with `wandb.project`, `wandb.entity`, and `wandb.mode`; runs
+share the requested `run_group`. The composed Hydra configuration and effective
+training settings are attached to each W&B run. Final visualization writes
+`policy.html` and `manager_goals.npy`; disable it with `capture_vis=false`.
+
+Checkpoints save both learners, optimizers, target critics, RNG, and counters.
+With `save_replay=true`, they also save both buffers and the active rollout,
+including unfinished command intervals. Resume into a fresh run directory:
+
+```sh
+uv run python main.py resume=/absolute/path/to/checkpoint.pkl \
+  online_steps=200000000 save_dir=runs run_group=pointmaze-resumed
+```
+
+Relative checkpoint paths are resolved against the invocation directory even
+when Hydra changes the working directory. Resume restores saved learning/environment
+settings; run budget, logging/checkpoint intervals, output, replay export, and
+visualization controls come from the new command. The effective restored
+settings are recorded in `config.json`. Without saved replay, collection starts
+fresh and warms up again while retaining the learner and counters.
 
 # Citing Scaling CRL 📜
 ```bibtex

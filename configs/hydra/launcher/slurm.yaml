@@ -1,0 +1,19 @@
+# Same Euler resources as dyna-mpo; override for another cluster/account.
+defaults:
+  - submitit_slurm
+  - _self_
+
+submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+timeout_min: 60
+cpus_per_task: 10
+tasks_per_node: 1
+nodes: 1
+mem_gb: null
+mem_per_cpu: 10240
+account: ls_krausea
+additional_parameters:
+  gpus: rtx_4090:1
+array_parallelism: 256
+# Resume explicitly from a checkpoint after a timeout rather than restarting
+# the experiment repeatedly with an unchanged training budget.
+max_num_timeout: 0

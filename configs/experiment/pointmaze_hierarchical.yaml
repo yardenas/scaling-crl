@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /agent: hierarchical_sac
+  - _self_
+
+run_group: pointmaze-hierarchical
+agent:
+  actor_depth: 16
+  critic_depth: 16
+
+hydra:
+  sweeper:
+    params:
+      seed: 0,1,2,3,4

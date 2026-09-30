@@ -37,6 +37,11 @@ class Args(LearnerConfig):
     updates_per_collect: int = 64
     log_every: int = 10  # collection iterations
     eval_every: int = 100
+    # Hydra uses environment-step intervals; None retains programmatic Args units.
+    log_interval: int | None = None
+    eval_interval: int | None = None
+    save_interval: int | None = None
+    run_group: str = "pointmaze-hierarchical"
     output_dir: str = ""
     resume: str = ""
     save_replay: bool = False
@@ -200,7 +205,7 @@ def render_policy(args, agent, key, output_dir):
     np.save(output_dir / "manager_goals.npy", np.asarray(commands))
 
 
-def main(args):
+def main(args, tracking_config=None):
     payload = None
     if args.resume:
         with Path(args.resume).open("rb") as file:
@@ -208,7 +213,8 @@ def main(args):
         # Restore the experiment configuration; allow changing run/output controls.
         controls = {name: getattr(args, name) for name in (
             "total_env_steps", "output_dir", "resume", "save_replay", "capture_vis",
-            "vis_length", "log_every", "eval_every", "track", "wandb_project", "wandb_entity", "wandb_mode")}
+            "vis_length", "log_every", "eval_every", "log_interval", "eval_interval",
+            "save_interval", "run_group", "track", "wandb_project", "wandb_entity", "wandb_mode")}
         args = replace(Args(**payload["config"]), **controls)
     if not (1 <= args.min_replay_size <= args.max_replay_size):
         raise ValueError("Require 1 <= min_replay_size <= max_replay_size.")
@@ -225,7 +231,10 @@ def main(args):
     if args.track:
         import wandb
         run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
-                         mode=args.wandb_mode, config=asdict(args), dir=str(output_dir))
+                         group=args.run_group, name=output_dir.name,
+                         mode=args.wandb_mode,
+                         config={**(tracking_config or {}), "training": asdict(args)},
+                         dir=str(output_dir))
 
     config = LearnerConfig(**{field.name: getattr(args, field.name) for field in fields(LearnerConfig)})
     key, init_key, reset_key = jax.random.split(jax.random.PRNGKey(args.seed), 3)
@@ -252,6 +261,9 @@ def main(args):
     metrics = {}
     print(f"Training fixed-target point U-maze; output: {output_dir}", flush=True)
 
+    def due(interval, previous_steps):
+        return interval > 0 and env_steps // interval > previous_steps // interval
+
     def report(values):
         record = {name: float(np.asarray(value)) for name, value in values.items()}
         record.update(env_steps=env_steps, gradient_steps=int(agent.gradient_steps))
@@ -262,6 +274,7 @@ def main(args):
             run.log(record, step=iteration)
 
     while env_steps < args.total_env_steps:
+        previous_steps = env_steps
         rollout, worker, manager, key, metrics = collect(agent, rollout, worker, manager, key)
         env_steps += steps_per_collect
         iteration += 1
@@ -270,7 +283,10 @@ def main(args):
             agent, key, learning_metrics = learn(agent, worker, manager, key)
             metrics = {**metrics, **learning_metrics}
         final = env_steps >= args.total_env_steps
-        if iteration % args.log_every == 0 or iteration % args.eval_every == 0 or final:
+        log_due = due(args.log_interval, previous_steps) if args.log_interval is not None else iteration % args.log_every == 0
+        eval_due = due(args.eval_interval, previous_steps) if args.eval_interval is not None else iteration % args.eval_every == 0
+        save_due = due(args.save_interval, previous_steps) if args.save_interval is not None else eval_due
+        if log_due or eval_due or final:
             if ready:
                 diagnostic_key = jax.random.fold_in(key, 1)
                 batch = manager.sample(diagnostic_key, min(args.batch_size, 16))
@@ -278,11 +294,12 @@ def main(args):
             metrics.update({"replay/worker_steps_per_env": worker.size,
                             "replay/manager_intervals": manager.sizes.sum(),
                             "training/sps": (env_steps - initial_steps) / (time.monotonic() - start_time)})
-            if iteration % args.eval_every == 0 or final:
+            if eval_due or final:
                 metrics.update(evaluate(agent, jax.random.fold_in(key, 2)))
-                save_checkpoint(output_dir / "checkpoint.pkl", args, agent, key, env_steps,
-                                iteration, rollout, worker, manager)
             report(metrics)
+        if save_due or final:
+            save_checkpoint(output_dir / "checkpoint.pkl", args, agent, key, env_steps,
+                            iteration, rollout, worker, manager)
 
     # Also save/evaluate a resumed run whose requested budget is already complete.
     if env_steps == initial_steps:
@@ -297,5 +314,5 @@ def main(args):
 
 
 if __name__ == "__main__":
-    import tyro
-    main(tyro.cli(Args))
+    from main import main as hydra_main
+    hydra_main()

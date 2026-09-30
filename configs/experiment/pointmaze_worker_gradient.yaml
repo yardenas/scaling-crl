@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - pointmaze_hierarchical
+  - _self_
+
+run_group: pointmaze-worker-gradient
+hydra:
+  sweeper:
+    params:
+      seed: 0,1,2,3,4
+      agent.manager_worker_weight: 0.0,1.0
