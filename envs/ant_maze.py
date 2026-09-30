@@ -328,12 +328,14 @@ class AntMaze(PipelineEnv):
         backend="generalized",
         maze_layout_name="u_maze",
         maze_size_scaling=4.0,
+        sparse_reward=False,
         **kwargs,
     ):
         xml_string, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
 
         sys = mjcf.loads(xml_string)
         self.possible_goals = possible_goals
+        self._sparse_reward = sparse_reward
 
         n_frames = 5
 
@@ -449,7 +451,7 @@ class AntMaze(PipelineEnv):
         dist = jp.linalg.norm(obs[:2] - obs[-2:])
         success = jp.array(dist < 0.5, dtype=float)
         success_easy = jp.array(dist < 2., dtype=float)
-        reward = -dist + healthy_reward - ctrl_cost - contact_cost
+        reward = success if self._sparse_reward else -dist + healthy_reward - ctrl_cost - contact_cost
         state.metrics.update(
             reward_forward=forward_reward,
             reward_survive=healthy_reward,

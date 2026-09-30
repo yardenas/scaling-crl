@@ -24,6 +24,11 @@ uv sync
 ```
 Then just fix the two Brax issues described below, and you'll be all set.
 
+On Linux, `uv sync` installs JAX 0.4.23's `cuda12_pip` extra, including the
+CUDA runtime, compiler, and math libraries. cuDNN is constrained to version 8
+to match this JAX wheel. Installing the CUDA-enabled `jaxlib` wheel alone
+does not install these dependencies.
+
 
 ## Fixing two bugs in brax 0.10.1
 1. There is a minor bug in brax's contact.py file. To fix it, first locate the brax contact.py file in your virtual environment: 
@@ -139,6 +144,84 @@ uv run python main.py +experiment=pointmaze_hierarchical \
   seed=0 online_steps=100000000 save_dir=runs
 ```
 
+A one-hour Euler learning check on the fixed-target U-maze (one seed):
+
+```sh
+source setup.bash
+uv run python main.py -m +experiment=pointmaze_one_hour hydra/launcher=slurm \
+  'hydra.launcher.setup=["source /cluster/home/yardas/scaling-crl/setup.bash", "export JAX_PLATFORMS=cuda", "export MUJOCO_GL=disable"]' \
+  save_dir=/cluster/scratch/$USER/scaling-crl
+```
+
+This preset stops training after 55 minutes and performs final evaluation and
+checkpointing, including replay, before the launcher's 60-minute limit.
+`max_runtime_seconds` is checked at collection/update boundaries, so allow
+headroom for one iteration and final evaluation. The hierarchical fixed-task
+experiment checks learning progress; it does not reproduce the original
+goal-conditioned CRL benchmark scores.
+
+Set `agent.manager_enabled=false` for a worker-only ablation, for example add
+`agent.manager_enabled=false run_group=pointmaze-worker-only` to the one-hour
+command. Collection, evaluation, and rendering send the fixed environment task
+goal directly to the worker. Manager inference, replay insertion/sampling,
+updates, and gradient diagnostics are skipped. Worker future-goal relabeling
+and entropy tuning are unchanged. The flag is saved in checkpoints and restored
+on resume; start fresh to compare the two modes. Unused manager parameters stay
+in the checkpoint but are never updated in worker-only mode.
+
+### Ant Big Maze with our worker
+
+`+experiment=ant_big_maze_worker` uses the same `main.py` worker-only path with
+the local Brax `ant_big_maze` training layout and `ant_big_maze_eval` evaluation
+layout. State/action dimensions are inferred from the environment (29 and 8).
+The environment supplies each episode's goal directly to the worker; the
+point-maze `target` setting does not apply. In worker-only mode, its dense
+environment reward is logged but is not used in the CRL updates.
+
+The preset follows the repository's `job.slurm`: 100M steps, depth 8, width 256,
+batch size 512, 512 parallel environments, 1,000-step episodes, and 800 updates
+per 62-step collection (approximately one update per 40 environment steps).
+Replay holds 10,000 steps per environment, with 1,000-step warmup. It uses our
+episode-filtered future-goal sampler and update loop, so this is a comparison
+of our implementation at the reference settings, not an exact rerun of `train.py`.
+
+```sh
+source setup.bash
+uv run python main.py -m +experiment=ant_big_maze_worker hydra/launcher=slurm \
+  hydra.launcher.timeout_min=1440 hydra.launcher.signal_delay_s=30 \
+  'hydra.launcher.setup=["source /cluster/home/yardas/scaling-crl/setup.bash", "export JAX_PLATFORMS=cuda", "export MUJOCO_GL=disable"]' \
+  seed=0 save_dir=/cluster/scratch/$USER/scaling-crl
+```
+
+Evaluation uses 128 deterministic episodes. `eval/success_steps` is the mean
+number of steps within the success radius, corresponding to the reference
+trainer's `eval/episode_success`; `eval/success_rate` instead counts episodes
+that ever succeed. `eval/return` is the environment reward and is a different
+metric. Checkpoints include replay when `save_replay=true`.
+The [paper](https://arxiv.org/html/2503.14858v4) uses five seeds for its main
+depth-scaling curves. This preset sweeps seeds 0–4 in multirun mode; pass
+`seed=0` for a single run or `seed=1,2,3,4` to add the remaining seeds.
+
+For algorithm comparisons, use `eval/success_steps` (time at goal), not dense
+`eval/return` or the fraction `eval/success_rate`. Following paper Section 4.1,
+average the last five evaluations for each completed training seed, then report
+the mean and standard error across seeds. Keep environment, network depth, and
+training budget matched; the paper's 441 ± 25 Ant Big Maze table entry is for
+depth 64, whereas this preset uses depth 8.
+
+After downloading one metrics file per seed, generate the comparison with:
+
+```sh
+MPLCONFIGDIR=/tmp/scaling-crl-matplotlib uv run python scripts/compare_antmaze.py \
+  runs/antmaze-paper-comparison/seed*.jsonl \
+  --output runs/antmaze-paper-comparison/report
+```
+
+An optional `--reference path/to/curve.csv` overlays `env_steps,success_steps`
+reference data. Figure-extracted data must be identified as approximate.
+The report withholds the final five-seed score until all five supplied runs
+reach 100M steps; partial curves remain available for monitoring.
+
 The configs are organized as follows:
 
 - `configs/main.yaml`: run budget, environment, replay, logging, W&B, and output paths.
@@ -156,6 +239,13 @@ depth retains the original CRL convention of four layers per residual block.
 Use `--cfg job --resolve` to inspect the composed experiment without training.
 
 ### Sweeps and Slurm
+
+On Euler, source your local `setup.bash` before launching. To also source it
+inside each submitted job, pass
+`hydra.launcher.setup=['source /cluster/home/yardas/scaling-crl/setup.bash']`
+(quote the entire override in the shell). To require GPU execution, add
+`export JAX_PLATFORMS=cuda` to that setup list; JAX will then fail explicitly
+if CUDA is unavailable instead of falling back to CPU.
 
 A local sweep runs the Cartesian product of the specified values:
 
@@ -248,6 +338,66 @@ settings; run budget, logging/checkpoint intervals, output, replay export, and
 visualization controls come from the new command. The effective restored
 settings are recorded in `config.json`. Without saved replay, collection starts
 fresh and warms up again while retaining the learner and counters.
+
+### Train only the manager with a pretrained worker
+
+Use `worker_checkpoint=/absolute/path/to/checkpoint.pkl` with
+`agent.freeze_worker=true` to initialize a new manager run. This loads the worker
+actor, both contrastive encoders, learned temperature, and their optimizer states.
+Worker network widths, depths, and activation choice come from the checkpoint.
+The manager, its target critics and optimizers, replay, RNG, and training counters
+start fresh. A source worker-only checkpoint does not disable the new manager.
+
+Freezing skips all worker optimizer/temperature updates and primitive replay
+storage/sampling. The manager retains its auxiliary gradient through the worker's
+actions and log probabilities; the goal-encoder input stays detached. Manager
+replay warms up for `start_training` primitive steps before optimization.
+`worker/frozen=1` is logged, together with the fixed worker temperature and manager
+losses/gradient diagnostics. `agent.manager_worker_weight=0` disables the auxiliary
+objective for a standard SAC manager ablation.
+
+For Ant Big Maze, the manager preset uses the existing training/evaluation goal
+distributions and 1,000-step episodes. The manager sees the full state and task
+goal and outputs absolute XY commands in `[2, 26]²`, held for 25 steps. Its task
+reward is 1 within distance 0.5 of the environment goal, 0 otherwise; reaching the
+goal does not terminate the episode. Unhealthy-ant termination is unchanged.
+Evaluation still reports `eval/success_steps` and `eval/success_rate`.
+
+```sh
+source setup.bash
+uv run python main.py -m +experiment=ant_big_maze_manager hydra/launcher=slurm \
+  worker_checkpoint=/absolute/path/to/worker/checkpoint.pkl \
+  hydra.launcher.timeout_min=1440 hydra.launcher.signal_delay_s=30 \
+  'hydra.launcher.setup=["source /cluster/home/yardas/scaling-crl/setup.bash", "export JAX_PLATFORMS=cuda", "export MUJOCO_GL=disable"]' \
+  seed=0,1,2,3,4 save_dir=/cluster/scratch/$USER/scaling-crl
+```
+
+This trains five fresh managers against the same frozen worker. To study worker
+seed variation, sweep `worker_checkpoint` as well. Each training run keeps a
+rolling `checkpoint.pkl` (overwritten at save intervals and at completion);
+copy the selected pretrained checkpoint to a stable path before launching a
+manager sweep if worker training is still running.
+
+Manager checkpoints include the frozen worker. Continue with `resume=...` alone;
+the original worker checkpoint is no longer needed. `resume` and
+`worker_checkpoint` are separate modes and cannot be passed together.
+
+A one-off CPU smoke sequence (no maintained test suite):
+
+```sh
+JAX_PLATFORMS=cpu uv run python main.py +experiment=smoke \
+  agent.manager_enabled=false hydra.run.dir=/tmp/crl-worker-smoke
+JAX_PLATFORMS=cpu uv run python main.py +experiment=smoke \
+  worker_checkpoint=/tmp/crl-worker-smoke/checkpoint.pkl agent.freeze_worker=true \
+  hydra.run.dir=/tmp/crl-manager-smoke
+JAX_PLATFORMS=cpu uv run python main.py +experiment=smoke \
+  resume=/tmp/crl-manager-smoke/checkpoint.pkl online_steps=100 \
+  hydra.run.dir=/tmp/crl-manager-resumed
+```
+
+Check worker parameter/optimizer equality across these checkpoints, changing
+manager parameters, finite losses, nonzero worker-path manager gradients, empty
+primitive replay, populated manager replay, and preserved freeze mode on resume.
 
 # Citing Scaling CRL 📜
 ```bibtex

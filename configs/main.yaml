@@ -16,6 +16,8 @@ hydra:
 
 run_group: pointmaze-hierarchical
 seed: 0
+env_id: point_u_maze
+eval_env_id: null
 save_dir: runs
 backend: generalized
 target: [12.0, 4.0]
@@ -23,6 +25,9 @@ episode_length: 1000
 num_envs: 128
 eval_episodes: 32
 online_steps: 100000000
+# Optional wall-clock training budget; finish the current collection/update,
+# then evaluate and save. Leave headroom before the Slurm time limit.
+max_runtime_seconds: null
 unroll_length: 64
 # Total transitions across all environments, rounded up to per-stream capacity.
 buffer_size: 1280000
@@ -36,6 +41,8 @@ eval_interval: 819200
 save_interval: 819200
 discount: 0.99
 resume: null
+# Initialize only the worker; manager, replay, RNG, and counters start fresh.
+worker_checkpoint: null
 save_replay: false
 capture_vis: true
 vis_length: 1000

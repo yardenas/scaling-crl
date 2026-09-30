@@ -1,4 +1,6 @@
 # Scaling-CRL worker and BroNet SAC manager. Entropy is in tanh coordinates.
+manager_enabled: true
+freeze_worker: false
 actor_lr: 3e-4
 critic_lr: 3e-4
 alpha_lr: 3e-4

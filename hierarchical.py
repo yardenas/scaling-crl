@@ -16,6 +16,8 @@ from crl_networks import Actor, G_encoder, SA_encoder
 
 @dataclass(frozen=True)
 class LearnerConfig:
+    manager_enabled: bool = True
+    freeze_worker: bool = False
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -223,20 +225,41 @@ class HierarchicalAgent:
     @jax.jit
     def update(self, worker_batch, manager_batch, key):
         worker_key, actor_key, critic_key = jax.random.split(key, 3)
-        (wa_loss, (worker_log_prob, score)), wa_grad = jax.value_and_grad(self.worker_actor_loss, has_aux=True)(self.worker_actor.params, worker_batch, worker_key)
-        wc_loss, wc_grad = jax.value_and_grad(self.worker_critic_loss)(self.worker_critic.params, worker_batch)
+        agent = self.replace(gradient_steps=self.gradient_steps + 1)
+        metrics = {
+            "worker/frozen": jnp.float32(self.config.freeze_worker),
+            "worker/temperature": jnp.exp(self.worker_alpha.params["log_alpha"]),
+        }
+        if not self.config.freeze_worker:
+            (wa_loss, (worker_log_prob, score)), wa_grad = jax.value_and_grad(self.worker_actor_loss, has_aux=True)(self.worker_actor.params, worker_batch, worker_key)
+            wc_loss, wc_grad = jax.value_and_grad(self.worker_critic_loss)(self.worker_critic.params, worker_batch)
+
+            def worker_alpha_loss(params):
+                target_entropy = -self.config.worker_entropy_coefficient * self.action_dim
+                return jnp.exp(params["log_alpha"]) * jnp.mean(jax.lax.stop_gradient(-worker_log_prob - target_entropy))
+
+            wal, wag = jax.value_and_grad(worker_alpha_loss)(self.worker_alpha.params)
+            agent = agent.replace(
+                worker_actor=self.worker_actor.apply_gradients(grads=wa_grad),
+                worker_critic=self.worker_critic.apply_gradients(grads=wc_grad),
+                worker_alpha=self.worker_alpha.apply_gradients(grads=wag),
+            )
+            metrics.update({
+                "worker/actor_loss": wa_loss, "worker/critic_loss": wc_loss,
+                "worker/alpha_loss": wal, "worker/score": score,
+                "worker/temperature": jnp.exp(agent.worker_alpha.params["log_alpha"]),
+                "worker/entropy": -worker_log_prob.mean(),
+            })
+        if not self.config.manager_enabled:
+            return agent, metrics
+
         (ma_loss, (manager_log_prob, q_loss, worker_loss)), ma_grad = jax.value_and_grad(self.manager_actor_loss, has_aux=True)(self.manager_actor.params, manager_batch, actor_key)
         (mc_loss, target), mc_grad = jax.value_and_grad(self.manager_critic_loss, has_aux=True)(self.manager_critic.params, manager_batch, critic_key)
-
-        def worker_alpha_loss(params):
-            target_entropy = -self.config.worker_entropy_coefficient * self.action_dim
-            return jnp.exp(params["log_alpha"]) * jnp.mean(jax.lax.stop_gradient(-worker_log_prob - target_entropy))
 
         def manager_alpha_loss(params):
             target_entropy = -self.config.manager_entropy_coefficient * len(self.config.goal_low)
             return -params["log_alpha"] * jnp.mean(jax.lax.stop_gradient(manager_log_prob + target_entropy))
 
-        wal, wag = jax.value_and_grad(worker_alpha_loss)(self.worker_alpha.params)
         mal, mag = jax.value_and_grad(manager_alpha_loss)(self.manager_alpha.params)
         # No valid TD rows means no optimizer step, including Adam momentum.
         manager_critic = jax.lax.cond(
@@ -244,21 +267,13 @@ class HierarchicalAgent:
             lambda _: self.manager_critic.apply_gradients(grads=mc_grad),
             lambda _: self.manager_critic, None,
         )
-        agent = self.replace(
-            worker_actor=self.worker_actor.apply_gradients(grads=wa_grad),
-            worker_critic=self.worker_critic.apply_gradients(grads=wc_grad),
-            worker_alpha=self.worker_alpha.apply_gradients(grads=wag),
+        agent = agent.replace(
             manager_actor=self.manager_actor.apply_gradients(grads=ma_grad),
             manager_critic=manager_critic,
             manager_alpha=self.manager_alpha.apply_gradients(grads=mag),
             target_manager_critic=optax.incremental_update(manager_critic.params, self.target_manager_critic, self.config.manager_tau),
-            gradient_steps=self.gradient_steps + 1,
         )
-        return agent, {
-            "worker/actor_loss": wa_loss, "worker/critic_loss": wc_loss,
-            "worker/alpha_loss": wal, "worker/score": score,
-            "worker/temperature": jnp.exp(agent.worker_alpha.params["log_alpha"]),
-            "worker/entropy": -worker_log_prob.mean(),
+        return agent, {**metrics,
             "manager/actor_loss": ma_loss, "manager/critic_loss": mc_loss,
             "manager/alpha_loss": mal, "manager/target": target,
             "manager/q_loss": q_loss, "manager/worker_loss": worker_loss,

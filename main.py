@@ -29,7 +29,8 @@ def training_args(cfg: DictConfig, output_dir: str):
     values["min_replay_size"] = max(1, per_stream(values.pop("start_training")))
     values["target"] = tuple(values["target"])
     values["output_dir"] = str(Path(output_dir).resolve())
-    values["resume"] = to_absolute_path(values["resume"]) if values["resume"] else ""
+    for name in ("resume", "worker_checkpoint"):
+        values[name] = to_absolute_path(values[name]) if values[name] else ""
     for name in ("goal_low", "goal_high"):
         agent[name] = tuple(agent[name])
     return Args(**values, **agent, track=wandb["enabled"],
