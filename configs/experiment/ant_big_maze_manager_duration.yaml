@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - ant_big_maze_manager_progress
+  - _self_
+
+run_group: ant-manager-fixed-goal-duration
+agent:
+  manager_learn_duration: true

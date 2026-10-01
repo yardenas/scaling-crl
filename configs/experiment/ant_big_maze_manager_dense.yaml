@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - ant_big_maze_manager_goal_starts
+  - _self_
+
+run_group: ant-manager-fixed-goal-dense
+manager_sparse_reward: false
+agent:
+  manager_worker_weight: 0.0

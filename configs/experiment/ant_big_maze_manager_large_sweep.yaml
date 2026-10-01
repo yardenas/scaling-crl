@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - ant_big_maze_manager_sweep
+  - _self_
+
+run_group: ant-manager-large-duration-activation-discount-sweep
+agent:
+  policy_hidden_layer_sizes: [256, 256, 256]
+  value_hidden_layer_sizes: [512, 512]  # Two width-512 BroNet residual blocks.

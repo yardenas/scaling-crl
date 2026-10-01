@@ -1,0 +1,7 @@
+# @package _global_
+defaults:
+  - ant_big_maze_manager_dense
+  - _self_
+
+run_group: ant-manager-fixed-goal-progress
+manager_progress_reward: true
