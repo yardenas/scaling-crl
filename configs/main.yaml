@@ -21,6 +21,11 @@ eval_env_id: null
 save_dir: runs
 backend: generalized
 target: [12.0, 4.0]
+manager_sparse_reward: true
+manager_progress_reward: false
+# AntMaze training only; evaluation/rendering always use normal starts.
+goal_start_probability: 0.0
+goal_start_radius: 0.25
 episode_length: 1000
 num_envs: 128
 eval_episodes: 32

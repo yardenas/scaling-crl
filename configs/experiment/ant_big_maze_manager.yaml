@@ -6,6 +6,9 @@ defaults:
 
 run_group: ant-big-maze-manager
 worker_checkpoint: ???
+# One downstream task; random-goal layouts are only used for worker pretraining.
+target: [24.0, 24.0]
+eval_env_id: ant_big_maze
 agent:
   manager_enabled: true
   freeze_worker: true

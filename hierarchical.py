@@ -6,12 +6,14 @@ from typing import Any
 
 import flax
 import flax.linen as nn
-from flax.training.train_state import TrainState
 import jax
 import jax.numpy as jnp
 import optax
+from flax.training.train_state import TrainState
 
 from crl_networks import Actor, G_encoder, SA_encoder
+
+MANAGER_ACTIVATIONS = {"relu": nn.relu, "swish": nn.swish, "elu": nn.elu}
 
 
 @dataclass(frozen=True)
@@ -31,33 +33,46 @@ class LearnerConfig:
     worker_entropy_coefficient: float = 0.5
     manager_width: int = 256
     manager_num_blocks: int = 2
+    policy_hidden_layer_sizes: tuple[int, ...] | None = None
+    value_hidden_layer_sizes: tuple[int, ...] | None = None
+    manager_activation: str = "relu"
     manager_lr: float = 3e-4
     manager_discount: float = 0.99
+    manager_discount_per_step: bool = True
     manager_tau: float = 0.005
     manager_init_temperature: float = 1.0
     manager_entropy_coefficient: float = 0.5
     manager_worker_weight: float = 1.0
     subgoal_steps: int = 25
+    manager_learn_duration: bool = False
+    max_subgoal_steps: int = 1000
     goal_low: tuple[float, float] = (2.0, 2.0)
     goal_high: tuple[float, float] = (14.0, 14.0)
+
+    @property
+    def manager_action_dim(self):
+        return 3 if self.manager_learn_duration else 2
 
 
 class ManagerActor(nn.Module):
     width: int = 256
     action_dim: int = 2
+    activation: str = "relu"
+    hidden_layer_sizes: tuple[int, ...] | None = None
 
     @nn.compact
     def __call__(self, observations):
+        activate = MANAGER_ACTIVATIONS[self.activation]
         x = observations
-        for _ in range(2):
-            x = nn.relu(nn.Dense(self.width)(x))
+        for width in self.hidden_layer_sizes or (self.width, self.width):
+            x = activate(nn.Dense(width)(x))
         mean = nn.Dense(self.action_dim)(x)
         log_std = -5.0 + 3.5 * (nn.tanh(nn.Dense(self.action_dim)(x)) + 1.0)
         return mean, log_std
 
 
 class BroCritic(nn.Module):
-    """BroNet: Dense/LN/ReLU stem, two-layer residual blocks, scalar head.
+    """BroNet: Dense/LN/activation stem, residual blocks, scalar head.
 
     Architecture: github.com/naumix/BiggerRegularizedOptimistic
     (jaxrl/networks/common.py). No distributional or optimistic extensions.
@@ -65,14 +80,16 @@ class BroCritic(nn.Module):
 
     width: int = 256
     num_blocks: int = 2
+    activation: str = "relu"
 
     @nn.compact
     def __call__(self, observations, actions):
+        activate = MANAGER_ACTIVATIONS[self.activation]
         dense = partial(nn.Dense, self.width,
                         kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))
-        x = nn.relu(nn.LayerNorm()(dense()(jnp.concatenate((observations, actions), -1))))
+        x = activate(nn.LayerNorm()(dense()(jnp.concatenate((observations, actions), -1))))
         for _ in range(self.num_blocks):
-            residual = nn.relu(nn.LayerNorm()(dense()(x)))
+            residual = activate(nn.LayerNorm()(dense()(x)))
             x = x + nn.LayerNorm()(dense()(residual))
         return nn.Dense(1, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)[..., 0]
 
@@ -80,11 +97,12 @@ class BroCritic(nn.Module):
 class ManagerCritics(nn.Module):
     width: int
     num_blocks: int
+    activation: str = "relu"
 
     @nn.compact
     def __call__(self, observations, actions):
         return jnp.stack([
-            BroCritic(self.width, self.num_blocks, name=f"q{i}")(observations, actions)
+            BroCritic(self.width, self.num_blocks, activation=self.activation, name=f"q{i}")(observations, actions)
             for i in range(2)
         ])
 
@@ -134,8 +152,12 @@ class HierarchicalAgent:
                         network_depth=c.critic_depth, use_relu=c.use_relu)
         goal = G_encoder(network_width=c.critic_network_width,
                          network_depth=c.critic_depth, use_relu=c.use_relu)
-        manager_actor = ManagerActor(c.manager_width)
-        manager_critic = ManagerCritics(c.manager_width, c.manager_num_blocks)
+        manager_actor = ManagerActor(width=c.manager_width, action_dim=c.manager_action_dim,
+                                     activation=c.manager_activation, hidden_layer_sizes=c.policy_hidden_layer_sizes)
+        value_sizes = c.value_hidden_layer_sizes or (c.manager_width,) * c.manager_num_blocks
+        if len(set(value_sizes)) != 1:
+            raise ValueError("BroNet residual blocks must all have the same width.")
+        manager_critic = ManagerCritics(value_sizes[0], len(value_sizes), activation=c.manager_activation)
         states, actions = jnp.ones((1, state_dim)), jnp.ones((1, action_dim))
         goals, observations = jnp.ones((1, 2)), jnp.ones((1, observation_dim))
 
@@ -146,7 +168,7 @@ class HierarchicalAgent:
             "sa_encoder": sa.init(keys[1], states, actions),
             "g_encoder": goal.init(keys[2], goals),
         }
-        manager_critic_params = manager_critic.init(keys[4], observations, goals)
+        manager_critic_params = manager_critic.init(keys[4], observations, jnp.ones((1, c.manager_action_dim)))
         return cls(
             worker_actor=train_state(actor.apply, actor.init(keys[0], jnp.concatenate((states, goals), -1)), c.actor_lr),
             worker_critic=train_state(None, critic_params, c.critic_lr),
@@ -161,7 +183,7 @@ class HierarchicalAgent:
 
     def goals(self, manager_actions):
         low, high = jnp.asarray(self.config.goal_low), jnp.asarray(self.config.goal_high)
-        return low + (manager_actions + 1.0) * (high - low) / 2.0
+        return low + (manager_actions[..., :2] + 1.0) * (high - low) / 2.0
 
     def manager_actions(self, observations, key, deterministic=False):
         return sample_policy(self.manager_actor.apply_fn, self.manager_actor.params,
@@ -196,12 +218,14 @@ class HierarchicalAgent:
     def manager_actor_terms(self, params, observations, key):
         high_key, low_key = jax.random.split(key)
         manager_actions, log_prob = sample_policy(self.manager_actor.apply_fn, params, observations, high_key)
+        q = self.manager_critic.apply_fn(self.manager_critic.params, observations, manager_actions).mean(0)
+        if self.config.manager_worker_weight == 0:
+            return log_prob, -q, jnp.zeros_like(log_prob)
         goals = self.goals(manager_actions)
         states = observations[..., :self.state_dim]
         inputs = jnp.concatenate((states, goals), -1)
         actions, worker_log_prob = sample_policy(self.worker_actor.apply_fn, self.worker_actor.params, inputs, low_key)
         score = self.worker_score(states, actions, jax.lax.stop_gradient(goals))
-        q = self.manager_critic.apply_fn(self.manager_critic.params, observations, manager_actions).mean(0)
         worker_loss = jnp.exp(self.worker_alpha.params["log_alpha"]) * worker_log_prob - score
         return log_prob, -q, self.config.manager_worker_weight * worker_loss
 
@@ -217,7 +241,9 @@ class HierarchicalAgent:
         actions, log_prob = sample_policy(self.manager_actor.apply_fn, self.manager_actor.params, next_observations, key)
         q = self.manager_critic.apply_fn(self.target_manager_critic, next_observations, actions).mean(0)
         soft_q = q - jnp.exp(self.manager_alpha.params["log_alpha"]) * log_prob
-        target = batch["rewards"] + self.config.manager_discount ** batch["duration"] * jnp.where(bootstrap > 0, soft_q, 0.0)
+        discount = (self.config.manager_discount ** batch["duration"]
+                    if self.config.manager_discount_per_step else self.config.manager_discount)
+        target = batch["rewards"] + discount * jnp.where(bootstrap > 0, soft_q, 0.0)
         qs = self.manager_critic.apply_fn(params, batch["observations"], batch["actions"])
         loss = masked_mean(jnp.mean((qs - jax.lax.stop_gradient(target)) ** 2, axis=0), batch["valid"])
         return loss, masked_mean(target, batch["valid"])
@@ -257,7 +283,7 @@ class HierarchicalAgent:
         (mc_loss, target), mc_grad = jax.value_and_grad(self.manager_critic_loss, has_aux=True)(self.manager_critic.params, manager_batch, critic_key)
 
         def manager_alpha_loss(params):
-            target_entropy = -self.config.manager_entropy_coefficient * len(self.config.goal_low)
+            target_entropy = -self.config.manager_entropy_coefficient * self.config.manager_action_dim
             return -params["log_alpha"] * jnp.mean(jax.lax.stop_gradient(manager_log_prob + target_entropy))
 
         mal, mag = jax.value_and_grad(manager_alpha_loss)(self.manager_alpha.params)

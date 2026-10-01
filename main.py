@@ -31,8 +31,9 @@ def training_args(cfg: DictConfig, output_dir: str):
     values["output_dir"] = str(Path(output_dir).resolve())
     for name in ("resume", "worker_checkpoint"):
         values[name] = to_absolute_path(values[name]) if values[name] else ""
-    for name in ("goal_low", "goal_high"):
-        agent[name] = tuple(agent[name])
+    for name in ("goal_low", "goal_high", "policy_hidden_layer_sizes", "value_hidden_layer_sizes"):
+        if agent[name] is not None:
+            agent[name] = tuple(agent[name])
     return Args(**values, **agent, track=wandb["enabled"],
                 wandb_project=wandb["project"], wandb_entity=wandb["entity"],
                 wandb_mode=wandb["mode"])

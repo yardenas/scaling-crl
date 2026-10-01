@@ -14,13 +14,19 @@ worker_discount: 0.99
 worker_entropy_coefficient: 0.5
 manager_width: 256
 manager_num_blocks: 2
+policy_hidden_layer_sizes: null
+value_hidden_layer_sizes: null
+manager_activation: relu
 manager_lr: 3e-4
 manager_discount: ${discount}
+manager_discount_per_step: true
 manager_tau: 0.005
 manager_init_temperature: 1.0
 manager_entropy_coefficient: 0.5
 manager_worker_weight: 1.0
 subgoal_steps: 25
+manager_learn_duration: false
+max_subgoal_steps: ${episode_length}
 goal_low: [2.0, 2.0]
 goal_high: [14.0, 14.0]
 batch_size: 256

@@ -65,8 +65,8 @@ class ManagerReplay:
     sizes: Any
 
     @classmethod
-    def create(cls, capacity, num_envs, observation_dim=6, goal_dim=2):
-        shapes = {"observations": (observation_dim,), "actions": (goal_dim,),
+    def create(cls, capacity, num_envs, observation_dim=6, action_dim=2):
+        shapes = {"observations": (observation_dim,), "actions": (action_dim,),
                   "next_observations": (observation_dim,), "rewards": (),
                   "duration": (), "bootstrap": (), "valid": ()}
         data = {name: jnp.zeros((capacity, num_envs) + shape) for name, shape in shapes.items()}
