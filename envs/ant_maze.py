@@ -330,8 +330,6 @@ class AntMaze(PipelineEnv):
         maze_size_scaling=4.0,
         sparse_reward=False,
         progress_reward=False,
-        goal_start_probability=0.0,
-        goal_start_radius=0.25,
         fixed_target=None,
         **kwargs,
     ):
@@ -341,8 +339,6 @@ class AntMaze(PipelineEnv):
         self.possible_goals = (possible_goals if fixed_target is None else
                                jp.asarray([fixed_target], dtype=jp.float32))
         self._sparse_reward = sparse_reward
-        self._goal_start_probability = goal_start_probability
-        self._goal_start_radius = goal_start_radius
 
         n_frames = 5
 
@@ -404,16 +400,6 @@ class AntMaze(PipelineEnv):
         q = q.at[-2:].set(target)
         qd = qd.at[-2:].set(0)
 
-        goal_start = jp.array(False)
-        if self._goal_start_probability > 0:
-            start_key, offset_key = jax.random.split(jax.random.fold_in(rng, 1))
-            goal_start = jax.random.bernoulli(start_key, self._goal_start_probability)
-            radius_sample, angle_sample = jax.random.uniform(offset_key, (2,))
-            radius = self._goal_start_radius * jp.sqrt(radius_sample)
-            angle = 2 * jp.pi * angle_sample
-            offset = radius * jp.array([jp.cos(angle), jp.sin(angle)])
-            q = q.at[:2].set(jp.where(goal_start, target + offset, q[:2]))
-
         pipeline_state = self.pipeline_init(q, qd)
         obs = self._get_obs(pipeline_state)
 
@@ -434,8 +420,6 @@ class AntMaze(PipelineEnv):
             "success_easy": zero
         }
         info = {"seed": 0}
-        if self._goal_start_probability > 0:
-            info["goal_start"] = goal_start
         state = State(pipeline_state, obs, reward, done, metrics)
         state.info.update(info)
         return state

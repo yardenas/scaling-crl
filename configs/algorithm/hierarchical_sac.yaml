@@ -1,3 +1,4 @@
+# @package agent
 # Scaling-CRL worker and BroNet SAC manager. Entropy is in tanh coordinates.
 manager_enabled: true
 freeze_worker: false
@@ -27,6 +28,9 @@ manager_worker_weight: 1.0
 subgoal_steps: 25
 manager_learn_duration: false
 max_subgoal_steps: ${episode_length}
-goal_low: [2.0, 2.0]
-goal_high: [14.0, 14.0]
+# Shared 4D position/command counts; zero scale disables the replay bonus.
+manager_count_bins: 16
+manager_count_bonus_scale: 0.0
+# Training-only selection by mean Q + count bonus; 1 uses the SAC sample.
+manager_action_candidates: 1
 batch_size: 256

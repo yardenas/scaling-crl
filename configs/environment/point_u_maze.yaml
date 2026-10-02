@@ -1,0 +1,9 @@
+# @package _global_
+env_id: point_u_maze
+eval_env_id: null
+backend: generalized
+target: [12.0, 4.0]
+episode_length: 1000
+agent:
+  goal_low: [2.0, 2.0]
+  goal_high: [14.0, 14.0]

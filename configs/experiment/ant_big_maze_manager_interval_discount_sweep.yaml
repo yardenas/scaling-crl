@@ -1,9 +1,0 @@
-# @package _global_
-defaults:
-  - ant_big_maze_manager_sweep
-  - _self_
-
-run_group: ant-manager-interval-discount-sweep
-agent:
-  # Sum primitive rewards and discount once per completed manager command.
-  manager_discount_per_step: false

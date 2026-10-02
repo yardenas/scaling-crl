@@ -16,7 +16,7 @@ import numpy as np
 from brax.envs.wrappers import training as wrappers
 
 from envs.simple_maze import SimpleMaze
-from envs.reset_wrapper import FinalObservationWrapper, ResamplingAutoResetWrapper
+from envs.reset_wrapper import FinalObservationWrapper
 from hierarchical import HierarchicalAgent, LearnerConfig
 from hierarchical_replay import ManagerReplay, WorkerReplay
 
@@ -30,8 +30,6 @@ class Args(LearnerConfig):
     target: tuple[float, float] = (12.0, 4.0)
     manager_sparse_reward: bool = True
     manager_progress_reward: bool = False
-    goal_start_probability: float = 0.0
-    goal_start_radius: float = 0.25
     episode_length: int = 1000
     num_envs: int = 128
     num_eval_envs: int = 32
@@ -71,9 +69,7 @@ def make_env(args, evaluation=False):
                        terminate_when_unhealthy=True,
                        sparse_reward=args.manager_enabled and args.manager_sparse_reward,
                        progress_reward=args.manager_enabled and args.manager_progress_reward,
-                       fixed_target=args.target if args.manager_enabled else None,
-                       goal_start_probability=0.0 if evaluation else args.goal_start_probability,
-                       goal_start_radius=args.goal_start_radius)
+                       fixed_target=args.target if args.manager_enabled else None)
     if env_id != "point_u_maze":
         raise ValueError(f"Unknown environment: {env_id}")
     return SimpleMaze(backend=args.backend, maze_layout_name="u_maze",
@@ -85,8 +81,6 @@ def wrap_env(args, evaluation=False):
     env = make_env(args, evaluation=evaluation)
     env = wrappers.EpisodeWrapper(env, episode_length=args.episode_length, action_repeat=1)
     env = FinalObservationWrapper(wrappers.VmapWrapper(env))
-    if args.goal_start_probability > 0 and not evaluation:
-        return ResamplingAutoResetWrapper(env)
     return wrappers.AutoResetWrapper(env)
 
 
@@ -110,13 +104,15 @@ class RolloutState:
     requested_steps: Any
     interval_return: Any
     episode_ids: Any
+    counts: Any = None
 
     @classmethod
-    def create(cls, env_state, manager_action_dim=2):
+    def create(cls, env_state, manager_action_dim=2, count_bins=0):
         n = env_state.obs.shape[0]
         return cls(env_state, jnp.zeros((n, manager_action_dim)), env_state.obs,
                    jnp.zeros(n, jnp.int32), jnp.zeros(n, jnp.int32),
-                   jnp.zeros(n), jnp.zeros(n, jnp.int32))
+                   jnp.zeros(n), jnp.zeros(n, jnp.int32),
+                   jnp.zeros(count_bins ** 4, jnp.int32) if count_bins else None)
 
 
 def advance(agent, rollout, key, env, deterministic=False):
@@ -132,8 +128,21 @@ def advance(agent, rollout, key, env, deterministic=False):
         inactive = jnp.zeros_like(done, dtype=jnp.bool_)
         return next_rollout, actions, None, inactive, inactive
     decision = rollout.duration == 0
-    proposed = agent.manager_actions(observations, manager_key, deterministic)
+    if not deterministic and agent.config.manager_action_candidates > 1:
+        # Avoid the candidate critic evaluations when all environments are holding.
+        proposed = jax.lax.cond(
+            jnp.any(decision),
+            lambda _: agent.exploratory_manager_actions(observations, manager_key, rollout.counts),
+            lambda _: rollout.manager_actions, None)
+    else:
+        proposed = agent.manager_actions(observations, manager_key, deterministic)
     manager_actions = jnp.where(decision[:, None], proposed, rollout.manager_actions)
+    counts = rollout.counts
+    if counts is not None and not deterministic:
+        # Scatter-add sums duplicate hits across environments. Never count held
+        # commands, discarded candidates, or replay samples.
+        indices = agent.count_indices(observations, manager_actions)
+        counts = counts.at[indices].add(decision.astype(jnp.int32))
     requested_steps = jnp.where(decision, commitment_steps(agent.config, proposed), rollout.requested_steps)
     start_observations = jnp.where(decision[:, None], observations, rollout.start_observations)
     actions = agent.worker_actions(observations, agent.goals(manager_actions), worker_key, deterministic)
@@ -163,6 +172,7 @@ def advance(agent, rollout, key, env, deterministic=False):
         requested_steps=jnp.where(completed, 0, requested_steps),
         interval_return=jnp.where(completed, 0.0, interval_return),
         episode_ids=rollout.episode_ids + done.astype(jnp.int32),
+        counts=counts,
     )
     return next_rollout, actions, manager_transition, completed, decision
 
@@ -219,17 +229,6 @@ def make_collector(env, unroll_length):
                 "collect/success": next_rollout.env_state.metrics["success"].mean(),
             }
             duration_stats = {}
-            if "goal_start" in rollout.env_state.info:
-                near = rollout.env_state.info["goal_start"]
-                done = next_rollout.env_state.done
-                reward = next_rollout.env_state.reward
-                metrics.update({
-                    "collect/goal_start_fraction": near.mean(),
-                    "collect/goal_start_episodes": (near * done).sum(),
-                    "collect/completed_episodes": done.sum(),
-                    "collect/goal_start_reward": jnp.sum(near * reward) / jnp.maximum(near.sum(), 1),
-                    "collect/normal_start_reward": jnp.sum(~near * reward) / jnp.maximum((~near).sum(), 1),
-                })
             if agent.config.manager_enabled:
                 manager = manager.insert(transition, completed)
                 metrics.update({
@@ -240,26 +239,44 @@ def make_collector(env, unroll_length):
                 })
                 duration_stats = duration_statistics(agent.config, transition["actions"], transition["duration"],
                                                      decision, completed, jnp.ones_like(decision))
+                if rollout.counts is not None:
+                    bonus = agent.count_bonus(rollout.counts, rollout.env_state.obs, transition["actions"])
+                    metrics["exploration/selection_bonus_sum"] = (bonus * decision).sum()
             return (next_rollout, worker, manager, key), (metrics, duration_stats)
 
         (rollout, worker_replay, manager_replay, key), (metrics, duration_stats) = jax.lax.scan(
             step, (rollout, worker_replay, manager_replay, key), None, length=unroll_length)
         metrics = {**jax.tree_util.tree_map(jnp.mean, metrics), **summarize_durations(duration_stats, "collect")}
+        if rollout.counts is not None:
+            metrics["exploration/selection_bonus"] = metrics.pop("exploration/selection_bonus_sum") / jnp.maximum(metrics["collect/manager_decisions"], 1e-8)
+            metrics.update({"exploration/visited_bins": (rollout.counts > 0).sum(),
+                            "exploration/coverage": (rollout.counts > 0).mean(),
+                            "exploration/total_commands": rollout.counts.sum(),
+                            "exploration/max_count": rollout.counts.max()})
         return rollout, worker_replay, manager_replay, key, metrics
     return collect
 
 
 def make_learner(args):
     @jax.jit
-    def learn(agent, worker_replay, manager_replay, key):
+    def learn(agent, worker_replay, manager_replay, key, counts=None):
         def step(carry, _):
             agent, key = carry
             key, worker_key, manager_key, update_key = jax.random.split(key, 4)
             worker_batch = (None if args.freeze_worker else
                             worker_replay.sample(worker_key, args.batch_size, args.worker_discount, args.episode_length))
             manager_batch = manager_replay.sample(manager_key, args.batch_size) if args.manager_enabled else None
+            bonus_metrics = {}
+            if args.manager_enabled and args.manager_count_bonus_scale > 0:
+                # Replay keeps task rewards; novelty decays with current counts.
+                bonus = agent.count_bonus(counts, manager_batch["observations"], manager_batch["actions"])
+                valid = manager_batch["valid"]
+                mean = lambda x: (x * valid).sum() / jnp.maximum(valid.sum(), 1)
+                bonus_metrics = {"exploration/replay_bonus": mean(bonus),
+                                 "exploration/replay_task_reward": mean(manager_batch["rewards"])}
+                manager_batch = {**manager_batch, "rewards": manager_batch["rewards"] + bonus}
             agent, metrics = agent.update(worker_batch, manager_batch, update_key)
-            return (agent, key), metrics
+            return (agent, key), {**metrics, **bonus_metrics}
         (agent, key), metrics = jax.lax.scan(step, (agent, key), None, length=args.updates_per_collect)
         return agent, key, jax.tree_util.tree_map(jnp.mean, metrics)
     return learn
@@ -375,10 +392,6 @@ def main(args, tracking_config=None):
         raise ValueError("freeze_worker requires manager_enabled=true.")
     if args.freeze_worker and not (args.resume or args.worker_checkpoint):
         raise ValueError("freeze_worker requires a pretrained worker_checkpoint (or resume).")
-    if not 0 <= args.goal_start_probability <= 1 or not 0 <= args.goal_start_radius <= 0.5:
-        raise ValueError("Require goal_start_probability in [0, 1] and goal_start_radius in [0, 0.5].")
-    if args.goal_start_probability > 0 and not args.env_id.startswith("ant_"):
-        raise ValueError("Goal-start training is currently supported for AntMaze.")
     if not (1 <= args.min_replay_size <= args.max_replay_size):
         raise ValueError("Require 1 <= min_replay_size <= max_replay_size.")
     if min(args.subgoal_steps, args.max_subgoal_steps, args.num_envs, args.num_eval_envs, args.unroll_length,
@@ -387,6 +400,8 @@ def main(args, tracking_config=None):
         raise ValueError("Batch sizes, horizons, replay sizes, and intervals must be positive.")
     if not 0 < args.worker_discount <= 1 or not 0 < args.manager_discount <= 1:
         raise ValueError("Discounts must be in (0, 1].")
+    if args.manager_count_bins < 1 or args.manager_action_candidates < 1 or args.manager_count_bonus_scale < 0:
+        raise ValueError("Count bins/candidates must be positive and bonus scale nonnegative.")
     output_dir = Path(args.output_dir or f"runs/hierarchical_{args.seed}_{datetime.now():%Y%m%d-%H%M%S}")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "config.json").write_text(json.dumps(asdict(args), indent=2))
@@ -402,7 +417,8 @@ def main(args, tracking_config=None):
     config = LearnerConfig(**{field.name: getattr(args, field.name) for field in fields(LearnerConfig)})
     key, init_key, reset_key = jax.random.split(jax.random.PRNGKey(args.seed), 3)
     env = wrap_env(args)
-    rollout = RolloutState.create(jax.jit(env.reset)(jax.random.split(reset_key, args.num_envs)), config.manager_action_dim)
+    rollout = RolloutState.create(jax.jit(env.reset)(jax.random.split(reset_key, args.num_envs)), config.manager_action_dim,
+                                  config.manager_count_bins if config.manager_enabled and config.manager_count_bonus_scale > 0 else 0)
     observation_dim = rollout.env_state.obs.shape[-1]
     state_dim, action_dim = observation_dim - 2, env.action_size
     agent = HierarchicalAgent.create(init_key, config, observation_dim=observation_dim,
@@ -428,7 +444,7 @@ def main(args, tracking_config=None):
     collect = make_collector(env, args.unroll_length)
     learn = make_learner(args)
     eval_env = (wrap_env(args, evaluation=True)
-                if args.goal_start_probability > 0 or (args.eval_env_id and args.eval_env_id != args.env_id) else env)
+                if args.eval_env_id and args.eval_env_id != args.env_id else env)
     evaluate = make_evaluator(eval_env, args.num_eval_envs, args.episode_length)
     steps_per_collect = args.num_envs * args.unroll_length
     initial_steps, start_time = env_steps, time.monotonic()
@@ -460,7 +476,7 @@ def main(args, tracking_config=None):
                  int(worker.size) >= args.min_replay_size)
         ready = ready and (not args.manager_enabled or int(manager.sizes.sum()) > 0)
         if ready:
-            agent, key, learning_metrics = learn(agent, worker, manager, key)
+            agent, key, learning_metrics = learn(agent, worker, manager, key, rollout.counts)
             metrics = {**metrics, **learning_metrics}
         time_limit_reached = (args.max_runtime_seconds is not None
                               and time.monotonic() - run_start >= args.max_runtime_seconds)

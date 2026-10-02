@@ -1,0 +1,9 @@
+# @package _global_
+env_id: ant_big_maze
+eval_env_id: null
+backend: spring
+target: [24.0, 24.0]
+episode_length: 1000
+agent:
+  goal_low: [2.0, 2.0]
+  goal_high: [26.0, 26.0]

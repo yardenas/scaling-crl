@@ -46,6 +46,9 @@ class LearnerConfig:
     subgoal_steps: int = 25
     manager_learn_duration: bool = False
     max_subgoal_steps: int = 1000
+    manager_count_bins: int = 16
+    manager_count_bonus_scale: float = 0.0
+    manager_action_candidates: int = 1
     goal_low: tuple[float, float] = (2.0, 2.0)
     goal_high: tuple[float, float] = (14.0, 14.0)
 
@@ -188,6 +191,39 @@ class HierarchicalAgent:
     def manager_actions(self, observations, key, deterministic=False):
         return sample_policy(self.manager_actor.apply_fn, self.manager_actor.params,
                              observations, key, deterministic)[0]
+
+    def count_indices(self, observations, actions):
+        """Flatten bins of (position XY, commanded XY); duration is not counted.
+
+        Position uses the same bounds as commands, clipping excursions to edge
+        cells. Leading batch/candidate dimensions follow NumPy broadcasting.
+        """
+        bins = self.config.manager_count_bins
+        low, high = jnp.asarray(self.config.goal_low), jnp.asarray(self.config.goal_high)
+        position = (observations[..., :2] - low) / (high - low)
+        command = (actions[..., :2] + 1.0) / 2.0
+        position = jnp.clip(jnp.floor(position * bins), 0, bins - 1).astype(jnp.int32)
+        command = jnp.clip(jnp.floor(command * bins), 0, bins - 1).astype(jnp.int32)
+        return ((position[..., 0] * bins + position[..., 1]) * bins ** 2
+                + command[..., 0] * bins + command[..., 1])
+
+    def count_bonus(self, counts, observations, actions):
+        if counts is None or self.config.manager_count_bonus_scale == 0:
+            return jnp.zeros(actions.shape[:-1])
+        visits = counts[self.count_indices(observations, actions)]
+        return self.config.manager_count_bonus_scale * jax.lax.rsqrt(1.0 + visits)
+
+    def exploratory_manager_actions(self, observations, key, counts):
+        """Collection-only best-of-N; SAC still learns the Gaussian policy."""
+        candidates = self.config.manager_action_candidates
+        if candidates == 1:
+            return self.manager_actions(observations, key)
+        actions = jax.vmap(lambda k: self.manager_actions(observations, k))(
+            jax.random.split(key, candidates))
+        candidate_obs = jnp.broadcast_to(observations, (candidates,) + observations.shape)
+        q = self.manager_critic.apply_fn(self.manager_critic.params, candidate_obs, actions).mean(0)
+        scores = q + self.count_bonus(counts, observations, actions)
+        return actions[jnp.argmax(scores, axis=0), jnp.arange(observations.shape[0])]
 
     def worker_actions(self, observations, goals, key, deterministic=False):
         inputs = jnp.concatenate((observations[..., :self.state_dim], goals), -1)
