@@ -18,6 +18,7 @@ hydra:
 run_group: ${env_id}-hierarchical
 seed: 0
 save_dir: runs
+terminate_on_success: false
 manager_sparse_reward: true
 manager_progress_reward: false
 num_envs: 128

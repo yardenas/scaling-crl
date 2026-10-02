@@ -17,6 +17,11 @@ def training_args(cfg: DictConfig, output_dir: str):
     wandb = values.pop("wandb")
     values.pop("save_dir")
     values.pop("discount")  # Resolved through agent.manager_discount.
+    task_id = values.pop("task_id", None)
+    if values["env_id"].replace("_", "-") == "puzzle-3x3":
+        if type(task_id) is not int or not 1 <= task_id <= 5:
+            raise ValueError("Puzzle task_id must be an integer from 1 to 5.")
+        values["env_id"] = f"puzzle-3x3-singletask-task{task_id}-v0"
     num_envs = values["num_envs"]
 
     def per_stream(total):
@@ -27,7 +32,8 @@ def training_args(cfg: DictConfig, output_dir: str):
     values["max_replay_size"] = per_stream(values.pop("buffer_size"))
     values["manager_replay_size"] = per_stream(values.pop("manager_buffer_size"))
     values["min_replay_size"] = max(1, per_stream(values.pop("start_training")))
-    values["target"] = tuple(values["target"])
+    if values.get("target") is not None:
+        values["target"] = tuple(values["target"])
     values["output_dir"] = str(Path(output_dir).resolve())
     for name in ("resume", "worker_checkpoint"):
         values[name] = to_absolute_path(values[name]) if values[name] else ""

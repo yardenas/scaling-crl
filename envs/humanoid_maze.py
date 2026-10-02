@@ -150,7 +150,7 @@ class HumanoidMaze(PipelineEnv):
         n_frames = 5
 
         if backend in ['spring', 'positional']:
-            sys = sys.replace(dt=0.0015)
+            sys = sys.tree_replace({"opt.timestep": 0.0015})
             n_frames = 10
             gear = jnp.array([
               350.0, 350.0, 350.0, 350.0, 350.0, 350.0, 350.0, 350.0, 350.0, 350.0,

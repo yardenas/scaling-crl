@@ -321,6 +321,7 @@ class AntMaze(PipelineEnv):
         contact_cost_weight=5e-4,
         healthy_reward=1.0,
         terminate_when_unhealthy=True,
+        terminate_on_success=False,
         healthy_z_range=(0.2, 1.0),
         contact_force_range=(-1.0, 1.0),
         reset_noise_scale=0.1,
@@ -343,7 +344,7 @@ class AntMaze(PipelineEnv):
         n_frames = 5
 
         if backend in ["spring", "positional"]:
-            sys = sys.replace(dt=0.005)
+            sys = sys.tree_replace({"opt.timestep": 0.005})
             n_frames = 10
 
         if backend == "mjx":
@@ -374,6 +375,7 @@ class AntMaze(PipelineEnv):
         self._healthy_reward = healthy_reward
         self._progress_reward = progress_reward
         self._terminate_when_unhealthy = terminate_when_unhealthy
+        self._terminate_on_success = terminate_on_success
         self._healthy_z_range = healthy_z_range
         self._contact_force_range = contact_force_range
         self._reset_noise_scale = reset_noise_scale
@@ -454,6 +456,8 @@ class AntMaze(PipelineEnv):
 
         dist = jp.linalg.norm(obs[:2] - obs[-2:])
         success = jp.array(dist < 0.5, dtype=float)
+        if self._terminate_on_success:
+            done = jp.maximum(done, success)
         success_easy = jp.array(dist < 2., dtype=float)
         reward = success if self._sparse_reward else -dist + healthy_reward - ctrl_cost - contact_cost
         if self._progress_reward:

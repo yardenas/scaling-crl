@@ -141,6 +141,7 @@ class SimpleMaze(PipelineEnv):
         contact_cost_weight=5e-4,
         healthy_reward=1.0,
         terminate_when_unhealthy=True,
+        terminate_on_success=False,
         healthy_z_range=(0.2, 1.0),
         contact_force_range=(-1.0, 1.0),
         reset_noise_scale=0.1,
@@ -193,6 +194,7 @@ class SimpleMaze(PipelineEnv):
         self._contact_cost_weight = contact_cost_weight
         self._healthy_reward = healthy_reward
         self._terminate_when_unhealthy = terminate_when_unhealthy
+        self._terminate_on_success = terminate_on_success
         self._healthy_z_range = healthy_z_range
         self._contact_force_range = contact_force_range
         self._reset_noise_scale = reset_noise_scale
@@ -280,6 +282,8 @@ class SimpleMaze(PipelineEnv):
 
         dist = jp.linalg.norm(obs[:2] - obs[-2:])
         success = jp.array(dist < 0.5, dtype=float)
+        if self._terminate_on_success:
+            done = jp.maximum(done, success)
         success_easy = jp.array(dist < 2., dtype=float)
         reward = -dist + healthy_reward - ctrl_cost - contact_cost
         if self.sparse_reward:

@@ -1,4 +1,4 @@
-"""Train a reward-driven SAC manager and a Scaling-CRL worker in Brax."""
+"""Train a reward-driven SAC manager and CRL worker in batched JAX environments."""
 
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
@@ -15,7 +15,6 @@ import jax.numpy as jnp
 import numpy as np
 from brax.envs.wrappers import training as wrappers
 
-from envs.simple_maze import SimpleMaze
 from envs.reset_wrapper import FinalObservationWrapper
 from hierarchical import HierarchicalAgent, LearnerConfig
 from hierarchical_replay import ManagerReplay, WorkerReplay
@@ -27,7 +26,11 @@ class Args(LearnerConfig):
     env_id: str = "point_u_maze"
     eval_env_id: str | None = None
     backend: str = "generalized"
-    target: tuple[float, float] = (12.0, 4.0)
+    env_config_overrides: dict[str, Any] | None = None
+    # MJX-Warp naconmax is a global budget across the vmapped worlds.
+    puzzle_contacts_per_env: int = 64
+    target: tuple[float, ...] | None = (12.0, 4.0)
+    terminate_on_success: bool = False
     manager_sparse_reward: bool = True
     manager_progress_reward: bool = False
     episode_length: int = 1000
@@ -62,23 +65,36 @@ class Args(LearnerConfig):
 
 def make_env(args, evaluation=False):
     env_id = (args.eval_env_id or args.env_id) if evaluation else args.env_id
+    if env_id.replace("_", "-").startswith("puzzle-"):
+        from envs.puzzle import PuzzleEnv
+        overrides = dict(args.env_config_overrides or {})
+        batch_size = args.num_eval_envs if evaluation else args.num_envs
+        overrides.setdefault("naconmax", batch_size * args.puzzle_contacts_per_env)
+        overrides.setdefault("episode_length", args.episode_length)
+        return PuzzleEnv(env_id, impl=args.backend, sparse=args.manager_sparse_reward,
+                         config_overrides=overrides, target=args.target)
     if env_id.startswith("ant_"):
         from envs.ant_maze import AntMaze
         return AntMaze(backend=args.backend, maze_layout_name=env_id[4:],
                        exclude_current_positions_from_observation=False,
                        terminate_when_unhealthy=True,
+                       terminate_on_success=args.terminate_on_success,
                        sparse_reward=args.manager_enabled and args.manager_sparse_reward,
                        progress_reward=args.manager_enabled and args.manager_progress_reward,
                        fixed_target=args.target if args.manager_enabled else None)
     if env_id != "point_u_maze":
         raise ValueError(f"Unknown environment: {env_id}")
+    from envs.simple_maze import SimpleMaze
     return SimpleMaze(backend=args.backend, maze_layout_name="u_maze",
                       fixed_target=args.target, sparse_reward=args.manager_sparse_reward,
-                      terminate_when_unhealthy=False)
+                      terminate_when_unhealthy=False, terminate_on_success=args.terminate_on_success)
 
 
 def wrap_env(args, evaluation=False):
     env = make_env(args, evaluation=evaluation)
+    if hasattr(env, "simulator"):
+        from envs.puzzle import PuzzleTrainingEnv
+        return PuzzleTrainingEnv(env, args.episode_length)
     env = wrappers.EpisodeWrapper(env, episode_length=args.episode_length, action_repeat=1)
     env = FinalObservationWrapper(wrappers.VmapWrapper(env))
     return wrappers.AutoResetWrapper(env)
@@ -89,7 +105,7 @@ def commitment_steps(config, manager_actions):
     if not config.manager_learn_duration:
         return jnp.full(manager_actions.shape[:-1], config.subgoal_steps, jnp.int32)
     nominal = min(config.subgoal_steps, config.max_subgoal_steps)
-    tau = manager_actions[..., 2]
+    tau = manager_actions[..., config.goal_dim]
     log_scale = jnp.where(tau <= 0, tau * jnp.log(float(nominal)),
                           tau * jnp.log(config.max_subgoal_steps / nominal))
     return jnp.clip(jnp.rint(nominal * jnp.exp(log_scale)), 1, config.max_subgoal_steps).astype(jnp.int32)
@@ -120,7 +136,7 @@ def advance(agent, rollout, key, env, deterministic=False):
     manager_key, worker_key = jax.random.split(key)
     observations = rollout.env_state.obs
     if not agent.config.manager_enabled:
-        goals = observations[..., agent.state_dim:agent.state_dim + 2]
+        goals = observations[..., agent.state_dim:agent.state_dim + agent.config.goal_dim]
         actions = agent.worker_actions(observations, goals, worker_key, deterministic)
         next_state = env.step(rollout.env_state, actions)
         done = next_state.done.astype(jnp.int32)
@@ -190,7 +206,7 @@ def duration_statistics(config, actions, duration, decision, completed, active):
         lower = upper
     stats["requested_over_500"] = (decision & (requested > 500)).sum()
     if config.manager_learn_duration:
-        tau = actions[..., 2]
+        tau = actions[..., config.goal_dim]
         stats.update(tau_sum=(tau * decision).sum(), tau_squared_sum=(tau ** 2 * decision).sum(),
                      tau_saturated=(decision & (jnp.abs(tau) > .99)).sum())
     return stats
@@ -223,18 +239,25 @@ def make_collector(env, unroll_length):
             key, action_key = jax.random.split(key)
             next_rollout, actions, transition, completed, decision = advance(agent, rollout, action_key, env)
             if not agent.config.freeze_worker:
-                worker = worker.insert(rollout.env_state.obs[:, :agent.state_dim], actions, rollout.episode_ids)
+                next_state = next_rollout.env_state
+                endpoint = jnp.where(next_state.info["final_observation_valid"][:, None],
+                                     next_state.info["final_observation"], next_state.obs)
+                worker = worker.insert(rollout.env_state.obs[:, :agent.state_dim], actions, rollout.episode_ids,
+                                       next_goals=endpoint[:, :agent.config.goal_dim])
             metrics = {
                 "collect/reward": next_rollout.env_state.reward.mean(),
                 "collect/success": next_rollout.env_state.metrics["success"].mean(),
             }
+            for name in ("valid", "nan_termination", "ik_no_solution"):
+                if name in next_rollout.env_state.metrics:
+                    metrics[f"collect/{name}"] = next_rollout.env_state.metrics[name].mean()
             duration_stats = {}
             if agent.config.manager_enabled:
                 manager = manager.insert(transition, completed)
                 metrics.update({
                     "collect/manager_decisions": decision.sum(),
                     "collect/completed_intervals": completed.sum(),
-                    "collect/goal_saturation": (jnp.abs(next_rollout.manager_actions[..., :2]) > .99).mean(),
+                    "collect/goal_saturation": (jnp.abs(next_rollout.manager_actions[..., :agent.config.goal_dim]) > .99).mean(),
                     "collect/masked_intervals": (completed * (1 - transition["valid"])).sum(),
                 })
                 duration_stats = duration_statistics(agent.config, transition["actions"], transition["duration"],
@@ -264,7 +287,7 @@ def make_learner(args):
             agent, key = carry
             key, worker_key, manager_key, update_key = jax.random.split(key, 4)
             worker_batch = (None if args.freeze_worker else
-                            worker_replay.sample(worker_key, args.batch_size, args.worker_discount, args.episode_length))
+                            worker_replay.sample(worker_key, args.batch_size, args.worker_discount, args.episode_length, args.goal_dim))
             manager_batch = manager_replay.sample(manager_key, args.batch_size) if args.manager_enabled else None
             bonus_metrics = {}
             if args.manager_enabled and args.manager_count_bonus_scale > 0:
@@ -346,6 +369,9 @@ def restore_worker(worker_state, agent):
 
 
 def render_policy(args, agent, key, output_dir):
+    if args.env_id.replace("_", "-").startswith("puzzle-"):
+        from envs.puzzle_render import render_policy as render_puzzle
+        return render_puzzle(args, agent, key, output_dir)
     from brax.io import html
 
     env = wrap_env(args, evaluation=True)
@@ -357,7 +383,7 @@ def render_policy(args, agent, key, output_dir):
         key, step_key = jax.random.split(key)
         rollout, _, _, _, decision = step(agent, rollout, step_key)
         goals = (agent.goals(rollout.manager_actions) if args.manager_enabled
-                 else rollout.env_state.obs[..., agent.state_dim:agent.state_dim + 2])
+                 else rollout.env_state.obs[..., agent.state_dim:agent.state_dim + agent.config.goal_dim])
         commands.append(np.asarray(goals[0]))
         durations.append(np.asarray(commitment_steps(agent.config, rollout.manager_actions)[0]))
         decisions.append(np.asarray(decision[0]))
@@ -381,7 +407,11 @@ def main(args, tracking_config=None):
             "total_env_steps", "max_runtime_seconds", "output_dir", "resume", "save_replay", "capture_vis",
             "vis_length", "log_every", "eval_every", "log_interval", "eval_interval",
             "save_interval", "run_group", "track", "wandb_project", "wandb_entity", "wandb_mode")}
-        args = replace(Args(**payload["config"]), **controls)
+        saved_config = dict(payload["config"])
+        # Earlier puzzle checkpoints stored an unused two-coordinate maze target.
+        if saved_config["env_id"].replace("_", "-").startswith("puzzle-") and len(saved_config.get("target") or ()) == 2:
+            saved_config["target"] = None
+        args = replace(Args(**saved_config), **controls)
     elif args.worker_checkpoint:
         with Path(args.worker_checkpoint).open("rb") as file:
             pretrained = pickle.load(file)
@@ -402,6 +432,11 @@ def main(args, tracking_config=None):
         raise ValueError("Discounts must be in (0, 1].")
     if args.manager_count_bins < 1 or args.manager_action_candidates < 1 or args.manager_count_bonus_scale < 0:
         raise ValueError("Count bins/candidates must be positive and bonus scale nonnegative.")
+    if not args.goal_low or len(args.goal_low) != len(args.goal_high) or any(
+            low >= high for low, high in zip(args.goal_low, args.goal_high)):
+        raise ValueError("Goal bounds must have matching dimensions with low < high.")
+    if args.goal_dim != 2 and args.manager_count_bonus_scale > 0:
+        raise ValueError("The XY count bonus is only supported for two-dimensional maze goals.")
     output_dir = Path(args.output_dir or f"runs/hierarchical_{args.seed}_{datetime.now():%Y%m%d-%H%M%S}")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "config.json").write_text(json.dumps(asdict(args), indent=2))
@@ -417,10 +452,12 @@ def main(args, tracking_config=None):
     config = LearnerConfig(**{field.name: getattr(args, field.name) for field in fields(LearnerConfig)})
     key, init_key, reset_key = jax.random.split(jax.random.PRNGKey(args.seed), 3)
     env = wrap_env(args)
+    if getattr(env.unwrapped, "goal_size", 2) != args.goal_dim:
+        raise ValueError("Goal bounds must match the environment's achieved-goal dimensions.")
     rollout = RolloutState.create(jax.jit(env.reset)(jax.random.split(reset_key, args.num_envs)), config.manager_action_dim,
                                   config.manager_count_bins if config.manager_enabled and config.manager_count_bonus_scale > 0 else 0)
     observation_dim = rollout.env_state.obs.shape[-1]
-    state_dim, action_dim = observation_dim - 2, env.action_size
+    state_dim, action_dim = observation_dim - config.goal_dim, env.action_size
     agent = HierarchicalAgent.create(init_key, config, observation_dim=observation_dim,
                                      state_dim=state_dim, action_dim=action_dim)
     if worker_state is not None:
@@ -428,7 +465,8 @@ def main(args, tracking_config=None):
         del worker_state
         print(f"Loaded worker from {args.worker_checkpoint}; freeze_worker={args.freeze_worker}. Manager starts fresh.", flush=True)
     worker = WorkerReplay.create(1 if args.freeze_worker else args.max_replay_size,
-                                 args.num_envs, state_dim, action_dim)
+                                 args.num_envs, state_dim, action_dim,
+                                 goal_dim=config.goal_dim if hasattr(env.unwrapped, "simulator") else None)
     manager = ManagerReplay.create(args.manager_replay_size if args.manager_enabled else 1,
                                    args.num_envs, observation_dim=observation_dim, action_dim=config.manager_action_dim)
     env_steps, iteration = 0, 0
@@ -438,13 +476,16 @@ def main(args, tracking_config=None):
         env_steps, iteration = payload["env_steps"], payload["iteration"]
         rollout = flax.serialization.from_state_dict(rollout, payload["rollout"])
         if "replay" in payload:
-            worker = flax.serialization.from_state_dict(worker, payload["replay"]["worker"])
+            worker_payload = dict(payload["replay"]["worker"])
+            # Older maze checkpoints predate optional endpoint-goal storage.
+            worker_payload.setdefault("next_goals", None)
+            worker = flax.serialization.from_state_dict(worker, worker_payload)
             manager = flax.serialization.from_state_dict(manager, payload["replay"]["manager"])
 
     collect = make_collector(env, args.unroll_length)
     learn = make_learner(args)
     eval_env = (wrap_env(args, evaluation=True)
-                if args.eval_env_id and args.eval_env_id != args.env_id else env)
+                if hasattr(env.unwrapped, "simulator") or (args.eval_env_id and args.eval_env_id != args.env_id) else env)
     evaluate = make_evaluator(eval_env, args.num_eval_envs, args.episode_length)
     steps_per_collect = args.num_envs * args.unroll_length
     initial_steps, start_time = env_steps, time.monotonic()

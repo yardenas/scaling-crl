@@ -49,12 +49,16 @@ class LearnerConfig:
     manager_count_bins: int = 16
     manager_count_bonus_scale: float = 0.0
     manager_action_candidates: int = 1
-    goal_low: tuple[float, float] = (2.0, 2.0)
-    goal_high: tuple[float, float] = (14.0, 14.0)
+    goal_low: tuple[float, ...] = (2.0, 2.0)
+    goal_high: tuple[float, ...] = (14.0, 14.0)
+
+    @property
+    def goal_dim(self):
+        return len(self.goal_low)
 
     @property
     def manager_action_dim(self):
-        return 3 if self.manager_learn_duration else 2
+        return self.goal_dim + int(self.manager_learn_duration)
 
 
 class ManagerActor(nn.Module):
@@ -162,7 +166,7 @@ class HierarchicalAgent:
             raise ValueError("BroNet residual blocks must all have the same width.")
         manager_critic = ManagerCritics(value_sizes[0], len(value_sizes), activation=c.manager_activation)
         states, actions = jnp.ones((1, state_dim)), jnp.ones((1, action_dim))
-        goals, observations = jnp.ones((1, 2)), jnp.ones((1, observation_dim))
+        goals, observations = jnp.ones((1, c.goal_dim)), jnp.ones((1, observation_dim))
 
         def train_state(apply_fn, params, lr):
             return TrainState.create(apply_fn=apply_fn, params=params, tx=optax.adam(lr))
@@ -186,7 +190,7 @@ class HierarchicalAgent:
 
     def goals(self, manager_actions):
         low, high = jnp.asarray(self.config.goal_low), jnp.asarray(self.config.goal_high)
-        return low + (manager_actions[..., :2] + 1.0) * (high - low) / 2.0
+        return low + (manager_actions[..., :self.config.goal_dim] + 1.0) * (high - low) / 2.0
 
     def manager_actions(self, observations, key, deterministic=False):
         return sample_policy(self.manager_actor.apply_fn, self.manager_actor.params,

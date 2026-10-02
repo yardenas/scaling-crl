@@ -14,15 +14,17 @@ class WorkerReplay:
     episode_ids: Any
     position: Any
     size: Any
+    next_goals: Any = None
 
     @classmethod
-    def create(cls, capacity, num_envs, state_dim=4, action_dim=2):
+    def create(cls, capacity, num_envs, state_dim=4, action_dim=2, goal_dim=None):
         return cls(jnp.zeros((capacity, num_envs, state_dim)),
                    jnp.zeros((capacity, num_envs, action_dim)),
                    jnp.zeros((capacity, num_envs), jnp.int32),
-                   jnp.int32(0), jnp.int32(0))
+                   jnp.int32(0), jnp.int32(0),
+                   None if goal_dim is None else jnp.zeros((capacity, num_envs, goal_dim)))
 
-    def insert(self, observations, actions, episode_ids):
+    def insert(self, observations, actions, episode_ids, next_goals=None):
         capacity = self.observations.shape[0]
         return self.replace(
             observations=self.observations.at[self.position].set(observations),
@@ -30,14 +32,19 @@ class WorkerReplay:
             episode_ids=self.episode_ids.at[self.position].set(episode_ids),
             position=(self.position + 1) % capacity,
             size=jnp.minimum(self.size + 1, capacity),
+            next_goals=(None if self.next_goals is None else
+                        self.next_goals.at[self.position].set(next_goals)),
         )
 
-    def sample(self, key, batch_size, discount, episode_length):
-        """Same geometric future-goal distribution and self fallback as CRL.
+    def sample(self, key, batch_size, discount, episode_length, goal_dim=2):
+        """Geometric future-goal sampling, without crossing episode boundaries.
 
         Logical indices preserve chronology when the storage ring wraps. Each
         environment has its own episode IDs; rows from other episodes, unwritten
         storage, and overwritten history cannot become positive goals.
+        With next_goals, sample transition endpoints, including success states
+        that disappear on autoreset. Otherwise retain legacy state sampling and
+        its self fallback.
         """
         time_key, env_key, goal_key = jax.random.split(key, 3)
         capacity, num_envs = self.episode_ids.shape
@@ -49,11 +56,14 @@ class WorkerReplay:
         future_times = times[:, None] + offsets
         future_indices = (oldest + future_times) % capacity
         same_episode = self.episode_ids[future_indices, envs[:, None]] == self.episode_ids[indices, envs, None]
-        valid = (future_times < self.size) & same_episode & (offsets > 0)
+        endpoints = self.next_goals is not None
+        valid = (future_times < self.size) & same_episode & ((offsets >= 0) if endpoints else (offsets > 0))
         log_weights = jnp.where(valid, offsets * jnp.log(discount), -jnp.inf)
-        log_weights = log_weights.at[:, 0].set(jnp.log(1e-5))
+        if not endpoints:
+            log_weights = log_weights.at[:, 0].set(jnp.log(1e-5))
         sampled_offsets = jax.random.categorical(goal_key, log_weights)
-        goals = self.observations[(oldest + times + sampled_offsets) % capacity, envs, :2]
+        goal_storage = self.next_goals if endpoints else self.observations[..., :goal_dim]
+        goals = goal_storage[(oldest + times + sampled_offsets) % capacity, envs]
         return {"observations": self.observations[indices, envs],
                 "actions": self.actions[indices, envs], "goals": goals}
 
