@@ -1,0 +1,16 @@
+# @package _global_
+env_id: puzzle_logic
+task_id: 1
+backend: logic
+target: null
+episode_length: 50
+terminate_on_success: true
+capture_vis: false
+agent:
+  manager_enabled: true
+  freeze_worker: true
+  manager_worker_weight: 0.0
+  manager_learn_duration: false
+  subgoal_steps: 1
+  goal_low: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  goal_high: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
