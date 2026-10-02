@@ -1,0 +1,10 @@
+# @package _global_
+env_id: puzzle_3x3
+task_id: 4  # OGBench task index, 1–5.
+backend: warp
+# null uses the selected task's goal; override with nine 0/1 bits in row order.
+target: null
+episode_length: 500
+agent:
+  goal_low: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  goal_high: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
