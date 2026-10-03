@@ -21,24 +21,24 @@ save_dir: runs
 terminate_on_success: false
 manager_sparse_reward: true
 manager_progress_reward: false
-num_envs: 128
-eval_episodes: 32
+num_envs: 512
+eval_episodes: 128
 online_steps: 100000000
 # Optional wall-clock training budget; finish the current collection/update,
 # then evaluate and save. Leave headroom before the Slurm time limit.
 max_runtime_seconds: null
-unroll_length: 64
+unroll_length: 62
 # Total transitions across all environments, rounded up to per-stream capacity.
-buffer_size: 1280000
+buffer_size: 5120000
 manager_buffer_size: 256000
-start_training: 128000
+start_training: 512000
 # Joint minibatch updates per num_envs * unroll_length collection batch.
-updates_per_collect: 64
+updates_per_collect: 800
 # Global environment-step intervals, executed at the next collection boundary.
-log_interval: 81920
-eval_interval: 819200
-save_interval: 819200
-discount: 0.99
+log_interval: 317440
+eval_interval: 984064
+save_interval: 984064
+discount: 0.95
 resume: null
 # Initialize only the worker; manager, replay, RNG, and counters start fresh.
 worker_checkpoint: null

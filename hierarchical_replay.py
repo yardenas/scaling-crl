@@ -7,6 +7,41 @@ import jax
 import jax.numpy as jnp
 
 
+def relabel_manager_transition(config, transition, completed, done):
+    """Hindsight action relabeling for completed, nonterminal maze intervals.
+
+    Preserve the original command on success, episode end (including timeout),
+    invalid endpoints, or endpoints outside the manager's goal bounds. In
+    particular, never clip an unreachable endpoint into a fictitious outcome.
+    This changes replay only: rollout commands, time coordinates, rewards, and
+    terminal masks are untouched. It is an endpoint-relabeling ablation, not the
+    full HiTS algorithm with a time-conditioned worker and subgoal testing.
+    """
+    low, high = jnp.asarray(config.goal_low), jnp.asarray(config.goal_high)
+    actions = transition["actions"]
+    achieved = transition["next_observations"][..., :config.goal_dim]
+    commanded = low + (actions[..., :config.goal_dim] + 1) * (high - low) / 2
+    error = jnp.linalg.norm(achieved - commanded, axis=-1)
+    representable = (jnp.all(jnp.isfinite(transition["next_observations"]), axis=-1)
+                     & jnp.all((achieved >= low) & (achieved <= high), axis=-1)
+                     & (transition["valid"] > 0))
+    eligible = completed & ~done & representable
+    reached = error < config.manager_hindsight_goal_tolerance
+    relabeled = eligible & ~reached
+    normalized = 2 * (achieved - low) / (high - low) - 1
+    new_actions = actions.at[..., :config.goal_dim].set(
+        jnp.where(relabeled[..., None], normalized, actions[..., :config.goal_dim]))
+    metrics = {
+        "relabel/eligible_intervals": eligible.sum(),
+        "relabel/relabeled_intervals": relabeled.sum(),
+        "relabel/retained_successful_intervals": (eligible & reached).sum(),
+        "relabel/retained_done_intervals": (completed & done).sum(),
+        "relabel/retained_unrepresentable_intervals": (completed & ~done & ~representable).sum(),
+        "relabel/goal_shift_sum": jnp.where(relabeled, error, 0).sum(),
+    }
+    return {**transition, "actions": new_actions}, metrics
+
+
 @flax.struct.dataclass
 class WorkerReplay:
     observations: Any

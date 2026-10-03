@@ -17,7 +17,7 @@ from brax.envs.wrappers import training as wrappers
 
 from envs.reset_wrapper import FinalObservationWrapper
 from hierarchical import HierarchicalAgent, LearnerConfig
-from hierarchical_replay import ManagerReplay, WorkerReplay
+from hierarchical_replay import ManagerReplay, WorkerReplay, relabel_manager_transition
 
 
 @dataclass(frozen=True)
@@ -39,16 +39,16 @@ class Args(LearnerConfig):
     manager_sparse_reward: bool = True
     manager_progress_reward: bool = False
     episode_length: int = 1000
-    num_envs: int = 128
-    num_eval_envs: int = 32
+    num_envs: int = 512
+    num_eval_envs: int = 128
     total_env_steps: int = 100_000_000
     max_runtime_seconds: float | None = None
-    unroll_length: int = 64
-    batch_size: int = 256
+    unroll_length: int = 62
+    batch_size: int = 512
     max_replay_size: int = 10000  # primitive time steps per environment
-    manager_replay_size: int = 2000  # completed intervals per environment
+    manager_replay_size: int = 500  # completed intervals per environment
     min_replay_size: int = 1000  # primitive time steps per environment
-    updates_per_collect: int = 64
+    updates_per_collect: int = 800
     log_every: int = 10  # collection iterations
     eval_every: int = 100
     # Hydra uses environment-step intervals; None retains programmatic Args units.
@@ -341,7 +341,12 @@ def make_collector(env, unroll_length):
                 })
             duration_stats = {}
             if agent.config.manager_enabled:
-                manager = manager.insert(transition, completed)
+                replay_transition = transition
+                if agent.config.manager_hindsight_relabel:
+                    replay_transition, relabel_metrics = relabel_manager_transition(
+                        agent.config, transition, completed, next_rollout.env_state.done.astype(bool))
+                    metrics.update(relabel_metrics)
+                manager = manager.insert(replay_transition, completed)
                 metrics.update({
                     "collect/manager_decisions": decision.sum(),
                     "collect/completed_intervals": completed.sum(),
@@ -361,6 +366,9 @@ def make_collector(env, unroll_length):
             step, (rollout, worker_replay, manager_replay, key), None, length=unroll_length)
         metrics = {**jax.tree_util.tree_map(jnp.mean, metrics), **summarize_durations(duration_stats, "collect"),
                    **summarize_worker_commands(worker_stats, "collect")}
+        if agent.config.manager_hindsight_relabel:
+            metrics["relabel/fraction"] = metrics["relabel/relabeled_intervals"] / jnp.maximum(metrics["collect/completed_intervals"], 1e-8)
+            metrics["relabel/mean_goal_shift"] = metrics.pop("relabel/goal_shift_sum") / jnp.maximum(metrics["relabel/relabeled_intervals"], 1e-8)
         if "collect/button_start_resets" in metrics:
             metrics["collect/button_start_reset_fraction"] = metrics["collect/button_start_resets"] / jnp.maximum(metrics["collect/completed_episodes"], 1e-8)
         if rollout.counts is not None:
@@ -555,6 +563,13 @@ def main(args, tracking_config=None):
         raise ValueError("Goal bounds must have matching dimensions with low < high.")
     if args.goal_dim != 2 and args.manager_count_bonus_scale > 0:
         raise ValueError("The XY count bonus is only supported for two-dimensional maze goals.")
+    if args.manager_hindsight_relabel:
+        if not args.manager_enabled or args.goal_dim != 2 or not (args.env_id.startswith("ant_") or args.env_id == "point_u_maze"):
+            raise ValueError("Manager hindsight relabeling currently supports two-dimensional maze goals only.")
+        if not np.isfinite(args.manager_hindsight_goal_tolerance) or args.manager_hindsight_goal_tolerance <= 0:
+            raise ValueError("Manager hindsight goal tolerance must be finite and positive.")
+        if args.manager_count_bonus_scale != 0:
+            raise ValueError("Manager hindsight pilot requires count bonuses disabled; original-command counts do not track relabeled commands.")
     output_dir = Path(args.output_dir or f"runs/hierarchical_{args.seed}_{datetime.now():%Y%m%d-%H%M%S}")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "config.json").write_text(json.dumps(asdict(args), indent=2))
