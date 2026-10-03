@@ -35,6 +35,6 @@ def render_policy(args, agent, key, output_dir):
     path = output_dir / "policy.npz"
     recorder.save(path, raw_env.simulator.mj_model, dict(
         env_name=raw_env.simulator._env_name, policy="learned", backend=args.backend,
-        ctrl_dt=raw_env.simulator.dt, seed=args.seed))
+        ctrl_dt=raw_env.simulator.dt, seed=args.seed, goal_mode=raw_env.goal_mode))
     np.save(output_dir / "manager_goals.npy", np.asarray(commands))
     render_rollout(path)

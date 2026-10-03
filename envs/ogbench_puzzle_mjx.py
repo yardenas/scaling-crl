@@ -29,6 +29,8 @@ def default_config() -> config_dict.ConfigDict:
     return config_dict.create(
         env_name=_DEFAULT_ENV_NAME,
         target_button_states=None,
+        button_start_probability=0.0,
+        button_start_height=0.04,
         ctrl_dt=0.05,
         sim_dt=0.005,
         episode_length=500,
@@ -354,7 +356,35 @@ class OGBenchPuzzle3x3(mjx_env.MjxEnv):
         self._t_pa_pos = np.asarray(ref_env._T_pa.translation(), dtype=np.float32)
         self._ctrl_low = np.asarray(self._mj_model.actuator_ctrlrange[:, 0], dtype=np.float32)
         self._ctrl_high = np.asarray(self._mj_model.actuator_ctrlrange[:, 1], dtype=np.float32)
+        if self._config.button_start_probability > 0:
+            self._prepare_button_starts(ref_env)
         ref_env.close()
+
+    def _prepare_button_starts(self, ref_env):
+        """Cache nine physical reset poses above buttons, without pressing them."""
+        from ogbench.manipspace import lie
+
+        qpos, ctrl = [], []
+        for site_id in self._button_site_ids:
+            position = ref_env._data.site_xpos[site_id].copy()
+            position[2] += self._config.button_start_height
+            pose = lie.SE3.from_rotation_and_translation(ref_env._effector_down_rotation, position)
+            attach = pose @ ref_env._T_pa
+            joints = ref_env._ik.solve(pos=attach.translation(), quat=attach.rotation().wxyz,
+                                      curr_qpos=ref_env._home_qpos)
+            data = mujoco.MjData(self._mj_model)
+            data.qpos[:] = self._init_qpos
+            data.qpos[self._arm_qposadr] = joints
+            data.ctrl[:] = self._init_ctrl
+            data.ctrl[self._arm_actuator_ids] = joints
+            mujoco.mj_forward(self._mj_model, data)
+            if (np.linalg.norm(data.site_xpos[self._pinch_site_id] - position) > 0.015
+                    or np.any(data.qpos[self._button_qposadr] <= -0.02)):
+                raise ValueError("Button-start pose is not an unpressed hover; increase button_start_height.")
+            qpos.append(data.qpos.copy())
+            ctrl.append(data.ctrl.copy())
+        self._button_start_qpos = jnp.asarray(np.asarray(qpos), dtype=jnp.float32)
+        self._button_start_ctrl = jnp.asarray(np.asarray(ctrl), dtype=jnp.float32)
 
     def _make_toggle_matrix(self) -> jax.Array:
         matrix = np.zeros((9, 9), dtype=np.int32)
@@ -389,11 +419,20 @@ class OGBenchPuzzle3x3(mjx_env.MjxEnv):
         return {}
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
+        qpos, qvel, ctrl = (jnp.asarray(self._init_qpos), jnp.asarray(self._init_qvel),
+                           jnp.asarray(self._init_ctrl))
+        button_start, start_button = jnp.asarray(False), jnp.asarray(-1, jnp.int32)
+        if self._config.button_start_probability > 0:
+            near_key, button_key = jax.random.split(rng)
+            button_start = jax.random.bernoulli(near_key, self._config.button_start_probability)
+            button = jax.random.randint(button_key, (), 0, 9)
+            qpos = jnp.where(button_start, self._button_start_qpos[button], qpos)
+            qvel = jnp.where(button_start, jnp.zeros_like(qvel), qvel)
+            ctrl = jnp.where(button_start, self._button_start_ctrl[button], ctrl)
+            start_button = jnp.where(button_start, button, -1)
         data = mjx_env.make_data(
             self._mj_model,
-            qpos=jnp.asarray(self._init_qpos),
-            qvel=jnp.asarray(self._init_qvel),
-            ctrl=jnp.asarray(self._init_ctrl),
+            qpos=qpos, qvel=qvel, ctrl=ctrl,
             impl=self._mjx_model.impl.value,
             naconmax=self._config.naconmax,
             njmax=self._config.njmax,
@@ -402,6 +441,8 @@ class OGBenchPuzzle3x3(mjx_env.MjxEnv):
         button_states = jnp.asarray(self._init_button_states, dtype=jnp.int32)
         info = {
             "rng": rng,
+            "button_start": button_start,
+            "start_button": start_button,
             "button_states": button_states,
             "prev_button_states": button_states,
             "prev_button_qpos": data.qpos[self._button_qposadr],

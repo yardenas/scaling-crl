@@ -13,6 +13,7 @@ import numpy as np
 from ogbench.manipspace.oracles.markov.button_markov import ButtonMarkovOracle
 
 from envs.ogbench_puzzle_mjx import OGBenchPuzzle3x3
+from experiments.puzzle_logic.puzzle_logic import toggle_matrix_3x3 as _toggle_matrix_3x3
 
 
 class _GymPuzzleEnv(Protocol):
@@ -26,19 +27,6 @@ class _OracleEnvAdapter:
     def __init__(self, arm_sampling_bounds: np.ndarray):
         self.unwrapped = self
         self._arm_sampling_bounds = np.asarray(arm_sampling_bounds, dtype=np.float64)
-
-
-def _toggle_matrix_3x3() -> np.ndarray:
-    matrix = np.zeros((9, 9), dtype=np.int32)
-    for row in range(3):
-        for col in range(3):
-            pressed = row * 3 + col
-            for drow, dcol in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
-                neighbor_row = row + drow
-                neighbor_col = col + dcol
-                if 0 <= neighbor_row < 3 and 0 <= neighbor_col < 3:
-                    matrix[pressed, neighbor_row * 3 + neighbor_col] = 1
-    return matrix
 
 
 def solve_puzzle_3x3_presses(

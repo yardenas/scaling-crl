@@ -76,6 +76,8 @@ def render_rollout(path, output=None, env_index=0, width=640, height=480, stride
         metadata = json.loads(str(archive["metadata_json"]))
         qpos, qvel = archive["qpos"], archive["qvel"]
         buttons, targets = archive["button_states"], archive["target_button_states"]
+        button_goals = metadata.get("goal_mode") == "button_xy_depression"
+        commands = archive["manager_goals"] if button_goals else None
     if not 0 <= env_index < qpos.shape[1]:
         raise ValueError(f"env_index must be between 0 and {qpos.shape[1] - 1}.")
     if min(width, height, stride) < 1:
@@ -106,9 +108,16 @@ def render_rollout(path, output=None, env_index=0, width=640, height=480, stride
                 draw = ImageDraw.Draw(labeled)
                 current = ''.join(str(int(b)) for b in buttons[t, env_index])
                 target = ''.join(str(int(b)) for b in targets[t, env_index])
-                draw.rectangle((0, 0, width, 36), fill="black")
+                draw.rectangle((0, 0, width, 52 if button_goals else 36), fill="black")
                 draw.text((8, 3), f"{metadata.get('policy', 'policy')} | step {t} | red=0 blue=1", fill="white")
-                draw.text((8, 19), f"buttons {current}   target {target}", fill="white")
+                if button_goals:
+                    goal = commands[min(t, len(commands) - 1), env_index]
+                    label = f"command XY=({goal[0]:.3f}, {goal[1]:.3f}) m  depression={goal[2]:.2f}"
+                else:
+                    label = f"buttons {current}   target {target}"
+                draw.text((8, 19), label, fill="white")
+                if button_goals:
+                    draw.text((8, 35), f"buttons {current}   task target {target}", fill="white")
                 writer.add_image(np.asarray(labeled))
                 if frame_index in sheet_indices:
                     sheet.append(labeled.resize((320, 240)))

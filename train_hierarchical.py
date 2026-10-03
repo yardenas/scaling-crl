@@ -29,6 +29,11 @@ class Args(LearnerConfig):
     env_config_overrides: dict[str, Any] | None = None
     # MJX-Warp naconmax is a global budget across the vmapped worlds.
     puzzle_contacts_per_env: int = 64
+    puzzle_button_start_probability: float = 0.0
+    puzzle_button_start_height: float = 0.04
+    puzzle_random_board_goals: bool = False
+    puzzle_goal_mode: str = "board"
+    puzzle_button_goal_depth: float = 0.021
     target: tuple[float, ...] | None = (12.0, 4.0)
     terminate_on_success: bool = False
     manager_sparse_reward: bool = True
@@ -63,6 +68,13 @@ class Args(LearnerConfig):
     wandb_mode: str = "offline"
 
 
+def resolve_puzzle_goal_config(args):
+    if args.env_id.replace("_", "-").startswith("puzzle-") and args.puzzle_goal_mode == "button_xy_depression":
+        # Preserve the pretrained worker's continuous XY/depression interface.
+        args = replace(args, goal_low=(0.25, -0.35, 0.), goal_high=(0.6, 0.35, 1.))
+    return args
+
+
 def make_env(args, evaluation=False):
     env_id = (args.eval_env_id or args.env_id) if evaluation else args.env_id
     if env_id.replace("_", "-").startswith("puzzle-"):
@@ -71,8 +83,15 @@ def make_env(args, evaluation=False):
         batch_size = args.num_eval_envs if evaluation else args.num_envs
         overrides.setdefault("naconmax", batch_size * args.puzzle_contacts_per_env)
         overrides.setdefault("episode_length", args.episode_length)
+        overrides["button_start_probability"] = 0.0 if evaluation else args.puzzle_button_start_probability
+        overrides["button_start_height"] = args.puzzle_button_start_height
+        if args.manager_enabled and args.puzzle_goal_mode == "button_xy_depression":
+            overrides["terminate_at_goal"] = args.terminate_on_success
         return PuzzleEnv(env_id, impl=args.backend, sparse=args.manager_sparse_reward,
-                         config_overrides=overrides, target=args.target)
+                         config_overrides=overrides, target=args.target,
+                         random_board_goals=args.puzzle_random_board_goals and not evaluation,
+                         goal_mode=args.puzzle_goal_mode, button_goal_depth=args.puzzle_button_goal_depth,
+                         manager_enabled=args.manager_enabled)
     if env_id.startswith("ant_"):
         from envs.ant_maze import AntMaze
         return AntMaze(backend=args.backend, maze_layout_name=env_id[4:],
@@ -94,7 +113,7 @@ def wrap_env(args, evaluation=False):
     env = make_env(args, evaluation=evaluation)
     if hasattr(env, "simulator"):
         from envs.puzzle import PuzzleTrainingEnv
-        return PuzzleTrainingEnv(env, args.episode_length)
+        return PuzzleTrainingEnv(env, args.episode_length, evaluation=evaluation)
     env = wrappers.EpisodeWrapper(env, episode_length=args.episode_length, action_repeat=1)
     env = FinalObservationWrapper(wrappers.VmapWrapper(env))
     return wrappers.AutoResetWrapper(env)
@@ -121,6 +140,7 @@ class RolloutState:
     interval_return: Any
     episode_ids: Any
     counts: Any = None
+    worker_goal_stats: Any = None
 
     @classmethod
     def create(cls, env_state, manager_action_dim=2, count_bins=0):
@@ -128,16 +148,19 @@ class RolloutState:
         return cls(env_state, jnp.zeros((n, manager_action_dim)), env_state.obs,
                    jnp.zeros(n, jnp.int32), jnp.zeros(n, jnp.int32),
                    jnp.zeros(n), jnp.zeros(n, jnp.int32),
-                   jnp.zeros(count_bins ** 4, jnp.int32) if count_bins else None)
+                   jnp.zeros(count_bins ** 4, jnp.int32) if count_bins else None,
+                   {name: jnp.zeros(n, bool) for name in ("reached", "initially_reached", "pressed", "wrong_press")}
+                   if "worker_goal" in env_state.info else None)
 
 
-def advance(agent, rollout, key, env, deterministic=False):
+def advance(agent, rollout, key, env, deterministic=False, worker_deterministic=None):
     """Shared commitment logic for collection, evaluation, and visualization."""
     manager_key, worker_key = jax.random.split(key)
     observations = rollout.env_state.obs
+    worker_deterministic = deterministic if worker_deterministic is None else worker_deterministic
     if not agent.config.manager_enabled:
         goals = observations[..., agent.state_dim:agent.state_dim + agent.config.goal_dim]
-        actions = agent.worker_actions(observations, goals, worker_key, deterministic)
+        actions = agent.worker_actions(observations, goals, worker_key, worker_deterministic)
         next_state = env.step(rollout.env_state, actions)
         done = next_state.done.astype(jnp.int32)
         next_rollout = rollout.replace(env_state=next_state, episode_ids=rollout.episode_ids + done)
@@ -161,7 +184,7 @@ def advance(agent, rollout, key, env, deterministic=False):
         counts = counts.at[indices].add(decision.astype(jnp.int32))
     requested_steps = jnp.where(decision, commitment_steps(agent.config, proposed), rollout.requested_steps)
     start_observations = jnp.where(decision[:, None], observations, rollout.start_observations)
-    actions = agent.worker_actions(observations, agent.goals(manager_actions), worker_key, deterministic)
+    actions = agent.worker_actions(observations, agent.goals(manager_actions), worker_key, worker_deterministic)
     next_state = env.step(rollout.env_state, actions)
     duration = rollout.duration + 1
     reward_weight = (agent.config.manager_discount ** rollout.duration
@@ -174,6 +197,21 @@ def advance(agent, rollout, key, env, deterministic=False):
     endpoint = jnp.where((done & final_available)[:, None],
                          next_state.info.get("final_observation", next_state.obs), next_state.obs)
     terminal = done & ~truncated
+    worker_goal_stats = rollout.worker_goal_stats
+    if worker_goal_stats is not None:
+        goals = agent.goals(manager_actions)
+        valid = next_state.metrics["valid"].astype(bool)
+        reached = worker_goal_match(endpoint[:, :3], goals) & valid
+        button = jnp.argmin(jnp.sum((env.unwrapped.button_xy - goals[:, None, :2]) ** 2, axis=-1), axis=-1)
+        presses = next_state.metrics["button_presses"] & valid[:, None]
+        pressed = presses[jnp.arange(len(goals)), button]
+        wrong_press = jnp.any(presses & (jnp.arange(9) != button[:, None]), axis=-1)
+        worker_goal_stats = {
+            "initially_reached": jnp.where(decision, worker_goal_match(observations[:, :3], goals),
+                                           worker_goal_stats["initially_reached"]),
+            **{name: jnp.where(decision, value, worker_goal_stats[name] | value)
+               for name, value in (("reached", reached), ("pressed", pressed), ("wrong_press", wrong_press))},
+        }
     manager_transition = {
         "observations": start_observations, "actions": manager_actions,
         "rewards": interval_return, "next_observations": endpoint,
@@ -189,8 +227,43 @@ def advance(agent, rollout, key, env, deterministic=False):
         interval_return=jnp.where(completed, 0.0, interval_return),
         episode_ids=rollout.episode_ids + done.astype(jnp.int32),
         counts=counts,
+        worker_goal_stats=worker_goal_stats,
     )
     return next_rollout, actions, manager_transition, completed, decision
+
+
+def worker_goal_match(achieved, goal):
+    """Continuous command attainment: 2 cm in XY, 0.1 normalized depression."""
+    return ((jnp.linalg.norm(achieved[..., :2] - goal[..., :2], axis=-1) <= .02)
+            & (jnp.abs(achieved[..., 2] - goal[..., 2]) <= .1))
+
+
+def worker_command_statistics(env, agent, rollout, completed, active):
+    if not agent.config.manager_enabled or rollout.worker_goal_stats is None:
+        return {}
+    goals = agent.goals(rollout.manager_actions)
+    button = jnp.argmin(jnp.sum((env.unwrapped.button_xy - goals[:, None, :2]) ** 2, axis=-1), axis=-1)
+    # Count physical press commands separately from shallow/release commands.
+    press_command = ((jnp.linalg.norm(goals[:, :2] - env.unwrapped.button_xy[button], axis=-1) <= .02)
+                     & (goals[:, 2] * env.unwrapped.button_travel[button] > .02))
+    finished = completed & active
+    stats = {name: (value & finished).sum() for name, value in rollout.worker_goal_stats.items()}
+    return {**stats, "intervals": finished.sum(), "press_commands": (press_command & finished).sum(),
+            "press_successes": (press_command & finished & rollout.worker_goal_stats["pressed"]).sum()}
+
+
+def summarize_worker_commands(stats, prefix):
+    if not stats:
+        return {}
+    totals = jax.tree_util.tree_map(jnp.sum, stats)
+    n = jnp.maximum(totals["intervals"], 1)
+    return {f"{prefix}/worker_goal_success_rate": totals["reached"] / n,
+            f"{prefix}/worker_goal_initially_reached_fraction": totals["initially_reached"] / n,
+            f"{prefix}/worker_wrong_button_fraction": totals["wrong_press"] / n,
+            f"{prefix}/worker_press_command_fraction": totals["press_commands"] / n,
+            f"{prefix}/worker_press_success_rate": totals["press_successes"] / jnp.maximum(totals["press_commands"], 1),
+            f"{prefix}/worker_evaluated_intervals": totals["intervals"],
+            f"{prefix}/worker_evaluated_press_commands": totals["press_commands"]}
 
 
 def duration_statistics(config, actions, duration, decision, completed, active):
@@ -251,6 +324,21 @@ def make_collector(env, unroll_length):
             for name in ("valid", "nan_termination", "ik_no_solution"):
                 if name in next_rollout.env_state.metrics:
                     metrics[f"collect/{name}"] = next_rollout.env_state.metrics[name].mean()
+            if "button_start" in rollout.env_state.info:
+                near = rollout.env_state.info["button_start"]
+                next_state = next_rollout.env_state
+                done = next_state.done.astype(bool)
+                endpoint = jnp.where(next_state.info["final_observation_valid"][:, None],
+                                     next_state.info["final_observation"], next_state.obs)
+                changed = (next_state.metrics["board_changed"].astype(bool) if "board_changed" in next_state.metrics else
+                           jnp.any(endpoint[:, :agent.config.goal_dim] != rollout.env_state.obs[:, :agent.config.goal_dim], axis=-1))
+                metrics.update({
+                    "collect/button_start_step_fraction": near.mean(),
+                    "collect/button_start_resets": (next_state.info["button_start"] & done).sum(),
+                    "collect/completed_episodes": done.sum(),
+                    "collect/button_change_fraction": changed.mean(),
+                    "collect/button_start_change_fraction": (changed & near).sum() / jnp.maximum(near.sum(), 1),
+                })
             duration_stats = {}
             if agent.config.manager_enabled:
                 manager = manager.insert(transition, completed)
@@ -265,11 +353,16 @@ def make_collector(env, unroll_length):
                 if rollout.counts is not None:
                     bonus = agent.count_bonus(rollout.counts, rollout.env_state.obs, transition["actions"])
                     metrics["exploration/selection_bonus_sum"] = (bonus * decision).sum()
-            return (next_rollout, worker, manager, key), (metrics, duration_stats)
+            worker_stats = worker_command_statistics(env, agent, next_rollout, completed,
+                                                       jnp.ones_like(completed))
+            return (next_rollout, worker, manager, key), (metrics, duration_stats, worker_stats)
 
-        (rollout, worker_replay, manager_replay, key), (metrics, duration_stats) = jax.lax.scan(
+        (rollout, worker_replay, manager_replay, key), (metrics, duration_stats, worker_stats) = jax.lax.scan(
             step, (rollout, worker_replay, manager_replay, key), None, length=unroll_length)
-        metrics = {**jax.tree_util.tree_map(jnp.mean, metrics), **summarize_durations(duration_stats, "collect")}
+        metrics = {**jax.tree_util.tree_map(jnp.mean, metrics), **summarize_durations(duration_stats, "collect"),
+                   **summarize_worker_commands(worker_stats, "collect")}
+        if "collect/button_start_resets" in metrics:
+            metrics["collect/button_start_reset_fraction"] = metrics["collect/button_start_resets"] / jnp.maximum(metrics["collect/completed_episodes"], 1e-8)
         if rollout.counts is not None:
             metrics["exploration/selection_bonus"] = metrics.pop("exploration/selection_bonus_sum") / jnp.maximum(metrics["collect/manager_decisions"], 1e-8)
             metrics.update({"exploration/visited_bins": (rollout.counts > 0).sum(),
@@ -310,15 +403,27 @@ def make_evaluator(env, num_envs, episode_length):
     def evaluate(agent, key):
         key, reset_key = jax.random.split(key)
         rollout = RolloutState.create(env.reset(jax.random.split(reset_key, num_envs)), agent.config.manager_action_dim)
+        button_goals = (getattr(env.unwrapped, "goal_mode", "board") == "button_xy_depression"
+                        and not agent.config.manager_enabled)
+        # Normal puzzle resets are identical. Measure execution variability with
+        # worker policy noise, retaining one fully deterministic reference episode.
+        manager_buttons = (getattr(env.unwrapped, "goal_mode", "board") == "button_xy_depression"
+                           and agent.config.manager_enabled)
+        worker_deterministic = jnp.arange(num_envs) == 0 if manager_buttons else None
+        if button_goals:
+            commanded_buttons = rollout.env_state.info["goal_button"]
         zeros = jnp.zeros(num_envs)
 
         def step(carry, _):
             rollout, key, active, returns, success, success_steps, distance, lengths = carry
             key, action_key = jax.random.split(key)
-            rollout, _, transition, completed, decision = advance(agent, rollout, action_key, env, deterministic=True)
+            rollout, _, transition, completed, decision = advance(agent, rollout, action_key, env, deterministic=True,
+                                                                   worker_deterministic=worker_deterministic)
+            measured = active & (jnp.arange(num_envs) > 0) if manager_buttons and num_envs > 1 else active
             duration_stats = (duration_statistics(agent.config, transition["actions"], transition["duration"],
-                                                   decision, completed, active)
+                                                   decision, completed, measured)
                               if agent.config.manager_enabled else {})
+            worker_stats = worker_command_statistics(env, agent, rollout, completed, measured)
             state = rollout.env_state
             returns += active * state.reward
             success = jnp.maximum(success, active * state.metrics["success"])
@@ -326,14 +431,24 @@ def make_evaluator(env, num_envs, episode_length):
             distance = jnp.where(active, state.metrics["dist"], distance)
             lengths += active
             active = active & ~state.done.astype(jnp.bool_)
-            return (rollout, key, active, returns, success, success_steps, distance, lengths), duration_stats
+            return (rollout, key, active, returns, success, success_steps, distance, lengths), (duration_stats, worker_stats)
 
-        result, duration_stats = jax.lax.scan(step, (rollout, key, jnp.ones(num_envs, bool), zeros, zeros, zeros, zeros, zeros), None, length=episode_length)
+        result, (duration_stats, worker_stats) = jax.lax.scan(step, (rollout, key, jnp.ones(num_envs, bool), zeros, zeros, zeros, zeros, zeros), None, length=episode_length)
         _, _, _, returns, success, success_steps, distance, lengths = result
-        return {"eval/return": returns.mean(), "eval/success_rate": success.mean(),
-                "eval/success_steps": success_steps.mean(),
-                "eval/final_distance": distance.mean(), "eval/episode_length": lengths.mean(),
-                **summarize_durations(duration_stats, "eval")}
+        average = lambda x: x[1:].mean() if manager_buttons and num_envs > 1 else x.mean()
+        metrics = {"eval/return": average(returns), "eval/success_rate": average(success),
+                   "eval/success_steps": average(success_steps),
+                   "eval/final_distance": average(distance), "eval/episode_length": average(lengths),
+                   **summarize_durations(duration_stats, "eval"), **summarize_worker_commands(worker_stats, "eval")}
+        if manager_buttons:
+            metrics.update({"eval/deterministic_success": success[0],
+                            "eval/stochastic_worker_episodes": jnp.asarray(num_envs - 1)})
+        if button_goals:
+            metrics["eval/button_success_rate"] = success.mean()
+            for button in range(min(9, num_envs)):
+                mask = commanded_buttons == button
+                metrics[f"eval/button_{button}_success_rate"] = jnp.sum(success * mask) / mask.sum()
+        return metrics
     return evaluate
 
 
@@ -418,10 +533,13 @@ def main(args, tracking_config=None):
         args = replace(args, **{name: pretrained["config"][name] for name in WORKER_ARCHITECTURE})
         worker_state = {name: pretrained["agent"][name] for name in WORKER_STATES}
         del pretrained  # Do not keep the source replay in memory.
+    args = resolve_puzzle_goal_config(args)
     if args.freeze_worker and not args.manager_enabled:
         raise ValueError("freeze_worker requires manager_enabled=true.")
     if args.freeze_worker and not (args.resume or args.worker_checkpoint):
         raise ValueError("freeze_worker requires a pretrained worker_checkpoint (or resume).")
+    if not 0 <= args.puzzle_button_start_probability <= 1 or args.puzzle_button_start_height <= 0:
+        raise ValueError("Require puzzle_button_start_probability in [0, 1] and positive height.")
     if not (1 <= args.min_replay_size <= args.max_replay_size):
         raise ValueError("Require 1 <= min_replay_size <= max_replay_size.")
     if min(args.subgoal_steps, args.max_subgoal_steps, args.num_envs, args.num_eval_envs, args.unroll_length,
@@ -487,6 +605,11 @@ def main(args, tracking_config=None):
     eval_env = (wrap_env(args, evaluation=True)
                 if hasattr(env.unwrapped, "simulator") or (args.eval_env_id and args.eval_env_id != args.env_id) else env)
     evaluate = make_evaluator(eval_env, args.num_eval_envs, args.episode_length)
+    worker_evaluate = None
+    if args.manager_enabled and args.puzzle_goal_mode == "button_xy_depression":
+        probe_args = replace(args, manager_enabled=False, freeze_worker=False, num_eval_envs=9)
+        worker_evaluate = make_evaluator(wrap_env(probe_args, evaluation=True), 9, args.episode_length)
+    best_evaluation = (-float("inf"), -float("inf"))
     steps_per_collect = args.num_envs * args.unroll_length
     initial_steps, start_time = env_steps, time.monotonic()
     warmup_steps = args.min_replay_size * args.num_envs
@@ -534,7 +657,17 @@ def main(args, tracking_config=None):
                             "replay/manager_intervals": manager.sizes.sum(),
                             "training/sps": (env_steps - initial_steps) / (time.monotonic() - start_time)})
             if eval_due or final:
-                metrics.update(evaluate(agent, jax.random.fold_in(key, 2)))
+                evaluation = evaluate(agent, jax.random.fold_in(key, 2))
+                metrics.update(evaluation)
+                if worker_evaluate is not None:
+                    probe = agent.replace(config=replace(agent.config, manager_enabled=False))
+                    metrics.update({name.replace("eval/", "worker_eval/"): value for name, value in
+                                    worker_evaluate(probe, jax.random.PRNGKey(2026)).items()})
+                selection = (float(evaluation["eval/success_rate"]), float(evaluation["eval/return"]))
+                if selection > best_evaluation:
+                    best_evaluation = selection
+                    save_checkpoint(output_dir / "best_checkpoint.pkl", replace(args, save_replay=False),
+                                    agent, key, env_steps, iteration, rollout, worker, manager)
             report(metrics)
         if save_due or final:
             save_checkpoint(output_dir / "checkpoint.pkl", args, agent, key, env_steps,

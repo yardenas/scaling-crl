@@ -10,7 +10,7 @@ from omegaconf import DictConfig, OmegaConf
 
 def training_args(cfg: DictConfig, output_dir: str):
     """Translate Hydra run controls into the vectorized trainer's units."""
-    from train_hierarchical import Args
+    from train_hierarchical import Args, resolve_puzzle_goal_config
 
     values = OmegaConf.to_container(cfg, resolve=True)
     agent = values.pop("agent")
@@ -40,9 +40,9 @@ def training_args(cfg: DictConfig, output_dir: str):
     for name in ("goal_low", "goal_high", "policy_hidden_layer_sizes", "value_hidden_layer_sizes"):
         if agent[name] is not None:
             agent[name] = tuple(agent[name])
-    return Args(**values, **agent, track=wandb["enabled"],
+    return resolve_puzzle_goal_config(Args(**values, **agent, track=wandb["enabled"],
                 wandb_project=wandb["project"], wandb_entity=wandb["entity"],
-                wandb_mode=wandb["mode"])
+                wandb_mode=wandb["mode"]))
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="main")
@@ -51,8 +51,10 @@ def main(cfg: DictConfig):
     from train_hierarchical import main as train
 
     output_dir = HydraConfig.get().runtime.output_dir
+    args = training_args(cfg, output_dir)
+    cfg.agent.goal_low, cfg.agent.goal_high = list(args.goal_low), list(args.goal_high)
     OmegaConf.save(cfg, Path(output_dir) / "resolved_config.yaml", resolve=True)
-    train(training_args(cfg, output_dir), tracking_config=OmegaConf.to_container(cfg, resolve=True))
+    train(args, tracking_config=OmegaConf.to_container(cfg, resolve=True))
     # Submitit serializes the return value; do not return the agent/optimizer trees.
 
 

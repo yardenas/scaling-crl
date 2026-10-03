@@ -117,7 +117,7 @@ class ManagerCritics(nn.Module):
 def sample_policy(apply_fn, params, observations, key, deterministic=False):
     mean, log_std = apply_fn(params, observations)
     noise = jax.random.normal(key, mean.shape)
-    pre_tanh = mean if deterministic else mean + jnp.exp(log_std) * noise
+    pre_tanh = jnp.where(jnp.asarray(deterministic)[..., None], mean, mean + jnp.exp(log_std) * noise)
     actions = jnp.tanh(pre_tanh)
     # Match the existing Scaling-CRL tanh Gaussian log probability.
     log_prob = jax.scipy.stats.norm.logpdf(pre_tanh, loc=mean, scale=jnp.exp(log_std))

@@ -5,6 +5,14 @@ backend: warp
 # null uses the selected task's goal; override with nine 0/1 bits in row order.
 target: null
 episode_length: 500
+# Training only: normal board, gripper poised above a uniformly sampled button.
+puzzle_button_start_probability: 0.1
+puzzle_button_start_height: 0.04
+# Training only: one uniformly sampled board goal per parallel environment.
+puzzle_random_board_goals: false
+# Worker pretraining: board or button_xy_depression.
+puzzle_goal_mode: board
+puzzle_button_goal_depth: 0.021  # metres; press threshold is 0.020.
 agent:
   goal_low: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   goal_high: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
